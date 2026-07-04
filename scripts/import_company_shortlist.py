@@ -81,6 +81,10 @@ async def import_shortlist(args: argparse.Namespace) -> dict[str, int]:
                 {"company_id": company["_id"], "email": email}
             )
 
+        if not application and not args.store_unmatched:
+            unmatched += 1
+            continue
+
         shortlist_doc = {
             "company_id": company["_id"],
             "company_name": args.company_name.strip(),
@@ -150,6 +154,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--role", required=True)
     parser.add_argument("--shortlist-sheet", required=True, help="Path to pasted TSV shortlist sheet text file.")
     parser.add_argument("--status", default="shortlisted")
+    parser.add_argument(
+        "--store-unmatched",
+        action="store_true",
+        help="Store shortlist rows that do not match an existing company application.",
+    )
     return parser.parse_args()
 
 
