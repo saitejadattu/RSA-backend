@@ -1,6 +1,8 @@
 from fastapi import APIRouter, Depends
 
 from app.schemas.auth import (
+    AdminLoginRequest,
+    AdminLoginResponse,
     AdminResetPasswordRequest,
     AdminResetPasswordResponse,
     LoginRequest,
@@ -25,6 +27,11 @@ async def check_student(payload: StudentCheckRequest) -> dict:
 @router.post("/login", response_model=LoginResponse)
 async def login(payload: LoginRequest) -> dict:
     return await auth_service.login(payload.identifier, payload.password)
+
+
+@router.post("/admin-login", response_model=AdminLoginResponse)
+async def admin_login(payload: AdminLoginRequest) -> dict:
+    return await auth_service.admin_login(payload.email, payload.password)
 
 
 @router.post("/set-password", response_model=SetPasswordResponse)

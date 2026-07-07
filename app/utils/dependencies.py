@@ -1,7 +1,7 @@
 from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from app.config.constants import ROLE_STUDENT, TOKEN_TYPE_ACCESS
+from app.config.constants import ROLE_ADMIN, ROLE_STUDENT, TOKEN_TYPE_ACCESS
 from app.config.settings import get_settings
 from app.db.collections import STUDENTS
 from app.db.mongodb import get_database
@@ -21,6 +21,22 @@ async def require_admin_sync_token(x_admin_token: str | None = Header(default=No
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid admin token",
         )
+
+
+async def require_admin_access(
+    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+) -> dict:
+    if credentials is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing admin token")
+
+    try:
+        payload = decode_token(credentials.credentials, expected_type=TOKEN_TYPE_ACCESS)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin token")
+
+    if payload.get("role") != ROLE_ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin access required")
+    return payload
 
 
 async def get_current_student(

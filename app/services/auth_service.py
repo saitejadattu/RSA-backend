@@ -7,6 +7,7 @@ from fastapi import HTTPException, status
 from app.config.constants import (
     AUTH_STATUS_AUTHENTICATED,
     AUTH_STATUS_PASSWORD_RESET_REQUIRED,
+    ROLE_ADMIN,
     ROLE_STUDENT,
     TOKEN_TYPE_ACCESS,
     TOKEN_TYPE_PASSWORD_RESET,
@@ -20,6 +21,10 @@ from app.utils.object_id import to_object_id
 from app.utils.password import hash_password, verify_password
 
 
+ADMIN_EMAIL = "admin@2931"
+ADMIN_PASSWORD = "admin2931"
+
+
 def _access_token(student: dict) -> str:
     settings = get_settings()
     return create_token(
@@ -27,6 +32,16 @@ def _access_token(student: dict) -> str:
         token_type=TOKEN_TYPE_ACCESS,
         expires_delta=timedelta(minutes=settings.jwt_access_token_expire_minutes),
         extra_claims={"role": ROLE_STUDENT},
+    )
+
+
+def _admin_access_token() -> str:
+    settings = get_settings()
+    return create_token(
+        subject=ADMIN_EMAIL,
+        token_type=TOKEN_TYPE_ACCESS,
+        expires_delta=timedelta(minutes=settings.jwt_access_token_expire_minutes),
+        extra_claims={"role": ROLE_ADMIN},
     )
 
 
@@ -78,6 +93,17 @@ async def login(identifier: str, password: str) -> dict:
         "status": AUTH_STATUS_AUTHENTICATED,
         "access_token": _access_token(student),
         "message": "Login successful",
+    }
+
+
+async def admin_login(email: str, password: str) -> dict:
+    if email.strip().lower() != ADMIN_EMAIL or password != ADMIN_PASSWORD:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin credentials")
+
+    return {
+        "status": AUTH_STATUS_AUTHENTICATED,
+        "access_token": _admin_access_token(),
+        "message": "Admin login successful",
     }
 
 

@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config.settings import get_settings
 from app.db.indexes import create_indexes
 from app.db.mongodb import close_mongo_connection, connect_to_mongo
-from app.routes import applications, auth, companies, interview_sessions, students
+from app.routes import admin, applications, auth, companies, interview_sessions, students
 
 
 @asynccontextmanager
@@ -31,6 +31,7 @@ app.add_middleware(
 )
 
 app.include_router(auth.router)
+app.include_router(admin.router)
 app.include_router(students.router)
 app.include_router(companies.router)
 app.include_router(interview_sessions.router)
