@@ -322,3 +322,111 @@ async def list_admin_students(limit: int = 500) -> list[dict]:
         )
 
     return serialize_mongo(student_rows)
+
+
+SKILL_KEYS = ("python", "nodejs", "react", "mongodb", "sql", "dsa", "javascript")
+
+
+async def get_admin_analytics() -> dict:
+    """Aggregated metrics for the admin analytics dashboard, read off the
+    normalized applications schema (current_status / application_details / placement)."""
+    db = get_database()
+
+    totals = {
+        "students": await db[STUDENTS].count_documents({}),
+        "companies": await db[COMPANIES].count_documents({}),
+        "opportunities": await db[HIRING_OPPORTUNITIES].count_documents({}),
+        "applications": await db[APPLICATIONS].count_documents({}),
+    }
+
+    status_raw = await db[APPLICATIONS].aggregate(
+        [
+            {"$group": {"_id": {"$ifNull": ["$current_status", "$status"]}, "n": {"$sum": 1}}},
+            {"$sort": {"n": -1, "_id": 1}},
+        ]
+    ).to_list(length=None)
+    status = [{"key": row["_id"] or "UNKNOWN", "n": row["n"]} for row in status_raw]
+
+    by_month_raw = await db[APPLICATIONS].aggregate(
+        [
+            {"$match": {"applied_at": {"$ne": None}}},
+            {"$group": {"_id": {"$dateToString": {"format": "%Y-%m", "date": "$applied_at"}}, "n": {"$sum": 1}}},
+            {"$sort": {"_id": 1}},
+        ]
+    ).to_list(length=None)
+    by_month = [{"month": row["_id"], "n": row["n"]} for row in by_month_raw if row["_id"]]
+
+    top_companies_raw = await db[APPLICATIONS].aggregate(
+        [
+            {"$group": {"_id": "$company_id", "n": {"$sum": 1}}},
+            {"$sort": {"n": -1}},
+            {"$limit": 10},
+            {"$lookup": {"from": COMPANIES, "localField": "_id", "foreignField": "_id", "as": "c"}},
+            {"$unwind": {"path": "$c", "preserveNullAndEmptyArrays": True}},
+            {"$project": {"_id": 0, "name": "$c.name", "n": 1}},
+        ]
+    ).to_list(length=None)
+    top_companies = [{"name": row.get("name") or "Unknown", "n": row["n"]} for row in top_companies_raw]
+
+    skills = []
+    for skill in SKILL_KEYS:
+        field = f"application_details.self_assessment.{skill}"
+        res = await db[APPLICATIONS].aggregate(
+            [
+                {"$match": {field: {"$type": "number"}}},
+                {"$group": {"_id": None, "avg": {"$avg": f"${field}"}, "n": {"$sum": 1}}},
+            ]
+        ).to_list(length=1)
+        skills.append(
+            {
+                "key": skill,
+                "avg": round(res[0]["avg"], 2) if res else None,
+                "n": res[0]["n"] if res else 0,
+            }
+        )
+    skills.sort(key=lambda item: item["avg"] or 0, reverse=True)
+
+    interested = await db[APPLICATIONS].count_documents({"application_details.interested": True})
+    not_interested = await db[APPLICATIONS].count_documents({"application_details.interested": False})
+
+    offer_raw = await db[APPLICATIONS].aggregate(
+        [
+            {"$match": {"placement.offer_letter.status": {"$ne": None}}},
+            {"$group": {"_id": "$placement.offer_letter.status", "n": {"$sum": 1}}},
+            {"$sort": {"n": -1}},
+        ]
+    ).to_list(length=None)
+    internship_raw = await db[APPLICATIONS].aggregate(
+        [
+            {"$match": {"placement.internship.status": {"$ne": None}}},
+            {"$group": {"_id": "$placement.internship.status", "n": {"$sum": 1}}},
+            {"$sort": {"n": -1}},
+        ]
+    ).to_list(length=None)
+
+    placed = await db[APPLICATIONS].count_documents({"placement.selected": True})
+    shortlisted = await db[APPLICATIONS].count_documents(
+        {"$or": [{"current_status": "SHORTLISTED"}, {"current_status": {"$exists": False}, "status": "shortlisted"}]}
+    )
+    joined = await db[APPLICATIONS].count_documents({"current_status": "JOINED"})
+
+    funnel = [
+        {"key": "Responses", "n": totals["applications"]},
+        {"key": "Interested", "n": interested},
+        {"key": "Shortlisted", "n": shortlisted},
+        {"key": "Selected / placed", "n": placed},
+        {"key": "Joined", "n": joined},
+    ]
+
+    return {
+        "totals": totals,
+        "funnel": funnel,
+        "status": status,
+        "by_month": by_month,
+        "top_companies": top_companies,
+        "skills": skills,
+        "interest": {"interested": interested, "not_interested": not_interested},
+        "offer_status": [{"key": row["_id"], "n": row["n"]} for row in offer_raw],
+        "internship_status": [{"key": row["_id"], "n": row["n"]} for row in internship_raw],
+        "placed": placed,
+    }

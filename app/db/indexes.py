@@ -7,9 +7,12 @@ from app.db.collections import (
     COMPANY_APPLICATIONS,
     COMPANY_SHORTLISTS,
     HIRING_OPPORTUNITIES,
+    INTERVIEW_REPORTS,
     INTERVIEW_SESSIONS,
+    QUESTIONS,
     STATUS_HISTORY,
     STUDENTS,
+    TRANSCRIPTS,
 )
 from app.db.mongodb import get_database
 
@@ -103,3 +106,23 @@ async def create_indexes() -> None:
     await db[STATUS_HISTORY].create_index([("new_status", ASCENDING)])
     await db[STATUS_HISTORY].create_index([("created_at", ASCENDING)])
     await db[STATUS_HISTORY].create_index([("application_id", ASCENDING), ("created_at", ASCENDING)])
+
+    # One transcript per interview session.
+    await db[TRANSCRIPTS].create_index([("session_id", ASCENDING)], unique=True)
+    await db[TRANSCRIPTS].create_index([("company_id", ASCENDING)])
+
+    # A question is stored once per (session, question_key); question_key groups
+    # the same question across sessions into the dedup'd bank.
+    await db[QUESTIONS].create_index([("session_id", ASCENDING), ("question_key", ASCENDING)], unique=True)
+    await db[QUESTIONS].create_index([("question_key", ASCENDING)])
+    await db[QUESTIONS].create_index([("company_id", ASCENDING)])
+    await db[QUESTIONS].create_index([("opportunity_id", ASCENDING)])
+    await db[QUESTIONS].create_index([("category", ASCENDING)])
+    await db[QUESTIONS].create_index([("is_technical", ASCENDING)])
+
+    # One report per (session, student).
+    await db[INTERVIEW_REPORTS].create_index([("session_id", ASCENDING), ("student_id", ASCENDING)], unique=True)
+    await db[INTERVIEW_REPORTS].create_index([("student_id", ASCENDING), ("visible_to_student", ASCENDING)])
+    await db[INTERVIEW_REPORTS].create_index([("company_id", ASCENDING)])
+    await db[INTERVIEW_REPORTS].create_index([("opportunity_id", ASCENDING)])
+    await db[INTERVIEW_REPORTS].create_index([("generated_at", ASCENDING)])

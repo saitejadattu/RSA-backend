@@ -20,6 +20,15 @@ class Settings(BaseSettings):
     admin_sync_token: str | None = None
     student_sheet_url: str | None = None
 
+    ai_provider: str = "gemini"
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4o-mini"
+    gemini_api_key: str | None = None
+    # gemini-2.5-flash / gemini-flash-latest have free-tier quota;
+    # gemini-2.5-pro and gemini-2.0-flash return 429 on this key.
+    gemini_model: str = "models/gemini-2.5-flash"
+    ai_max_transcript_chars: int = 120_000
+
     cors_origins: List[str] = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
