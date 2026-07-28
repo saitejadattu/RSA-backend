@@ -36,6 +36,7 @@ async def get_my_reports(current_student: dict = Depends(get_current_student)) -
 async def get_practice_questions(
     include_scenario: bool = Query(default=False, description="Scenario questions are hidden unless asked for."),
     category: str | None = None,
+    company: str | None = None,
     difficulty: str | None = None,
     search: str | None = None,
     limit: int = Query(default=300, ge=1, le=500),
@@ -49,6 +50,7 @@ async def get_practice_questions(
     return await student_practice_questions(
         include_scenario=include_scenario,
         category=category,
+        company=company,
         difficulty=difficulty,
         search=search,
         limit=limit,

@@ -34,6 +34,28 @@ class SheetPasteRequest(BaseModel):
 
     raw_text: str = Field(..., min_length=1, description="Sheet contents pasted as TSV or CSV, header row included.")
     confirm: bool = Field(default=False, description="False previews without writing; true performs the import.")
+    replace: bool = Field(
+        default=False,
+        description="Remove response-sourced candidates not in this sheet (safe ones deleted, advanced ones flagged).",
+    )
+
+
+class SheetSyncRequest(BaseModel):
+    """Fetch the opening's stored sheet URL and import it. confirm=false previews."""
+
+    confirm: bool = Field(default=False, description="False previews without writing; true performs the import.")
+    force: bool = Field(default=False, description="Re-import even if this opening was already extracted.")
+    replace: bool = Field(
+        default=False,
+        description="Remove response-sourced candidates not in this sheet (safe ones deleted, advanced ones flagged).",
+    )
+
+
+class SheetUrlRequest(BaseModel):
+    """Fetch a sheet by URL and import it. confirm=false previews."""
+
+    url: str = Field(..., min_length=1, description="A public ('anyone with the link') Google Sheets URL.")
+    confirm: bool = Field(default=False, description="False previews without writing; true performs the import.")
 
 
 class TranscriptConfirmRequest(BaseModel):

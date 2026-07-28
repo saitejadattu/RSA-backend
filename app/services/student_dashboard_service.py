@@ -73,6 +73,22 @@ async def list_student_applications(student: dict, *, include_not_interested: bo
                 "project_link": {"$ifNull": ["$application_details.project_link", "$project_link"]},
                 "resume_link": {"$ifNull": ["$application_details.submitted_resume_url", "$resume_link"]},
                 "shortlist": 1,
+                # The company's per-candidate remark, shown to the student so they
+                # can act on it. Only surfaced when marked visible_to_student.
+                "screening_remark": {
+                    "$cond": [
+                        {"$eq": ["$screening.visible_to_student", True]},
+                        "$screening.remark",
+                        None,
+                    ]
+                },
+                "screening_decision": {
+                    "$cond": [
+                        {"$eq": ["$screening.visible_to_student", True]},
+                        "$screening.decision",
+                        None,
+                    ]
+                },
                 "not_interested_reason": {
                     "$ifNull": ["$application_details.non_interest_reason", "$not_interested_reason"]
                 },

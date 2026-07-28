@@ -955,6 +955,7 @@ async def student_practice_questions(
     *,
     include_scenario: bool = False,
     category: str | None = None,
+    company: str | None = None,
     difficulty: str | None = None,
     search: str | None = None,
     limit: int = 300,
@@ -978,6 +979,12 @@ async def student_practice_questions(
         match["difficulty"] = normalize_difficulty(difficulty)
     if search and search.strip():
         match["question_text"] = {"$regex": re.escape(search.strip()), "$options": "i"}
+    if company and company.strip():
+        matched = await db[COMPANIES].find(
+            {"name": {"$regex": re.escape(company.strip()), "$options": "i"}}, {"_id": 1}
+        ).to_list(length=None)
+        # No such company -> match nothing rather than everything.
+        match["company_id"] = {"$in": [item["_id"] for item in matched]}
 
     pipeline: list[dict[str, Any]] = [
         {"$match": match},
@@ -1046,11 +1053,19 @@ async def student_practice_questions(
     categories = sorted({row["_id"]["category"] for row in facets if row["_id"].get("category")})
     scenario_count = sum(row["n"] for row in facets if row["_id"].get("question_type") == "scenario")
 
+    # Companies that have at least one reusable technical question, for the filter.
+    company_ids = await db[QUESTIONS].distinct("company_id", {"is_technical": True, "is_reusable": True})
+    company_docs = await db[COMPANIES].find(
+        {"_id": {"$in": company_ids}}, {"name": 1}
+    ).to_list(length=None)
+    companies = sorted({doc.get("name") for doc in company_docs if doc.get("name")})
+
     return {
         "questions": questions,
         "groups": groups,
         "total": len(questions),
         "categories": categories,
+        "companies": companies,
         "scenario_available": scenario_count,
         "include_scenario": include_scenario,
     }
