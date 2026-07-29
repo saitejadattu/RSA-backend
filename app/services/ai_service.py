@@ -96,11 +96,23 @@ TASK 2 - REPORT for this candidate only. Do this only after TASK 1 is complete.
     clarity for them. Judge clarity on structure and completeness of ideas.
   * student_answer: what they actually said, tidied into readable prose.
   * accuracy 0-100. ideal_answer: a brief correct answer they can learn from.
-  * score 0-10 overall; verdict strong | average | weak.
-  * improvements: specific and actionable, tied to what they actually got wrong.
+  * score 0-10 overall; verdict strong | average | weak. (score and verdict are
+    for admins only and never appear in the text the student reads.)
+  * summary: 2-4 sentences spoken DIRECTLY TO the student as "you" - what you did
+    well overall and the main thing to work on next. Plain and encouraging.
+  * strengths: what you did well, each point addressed to "you".
+  * improvements: specific and actionable, tied to what you actually got wrong,
+    each point addressed to "you".
   * skill_ratings: 1-5, ONLY for skills actually evidenced.
   * interviewer_feedback: if the interviewer gave the candidate verbal feedback
     or advice, quote it as closely as the transcript allows. Empty string if none.
+
+VOICE - summary, strengths and improvements speak DIRECTLY to the student. Use
+"you", never "the candidate", "they/them", or the student's name. Keep it simple
+and clear, like a mentor talking to them one-on-one:
+  GOOD: "You explained indexing well, but your definition of SQL views was
+         unclear - revise what a view is and when to use one."
+  BAD:  "The candidate's explanation of SQL views was unclear."
 
 This feedback is shown to the student. Be fair, specific and evidence-based.
 """

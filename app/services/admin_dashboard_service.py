@@ -1,10 +1,13 @@
 import re
 from datetime import datetime, timedelta, timezone
 
-from app.db.collections import APPLICATIONS, COMPANIES, HIRING_OPPORTUNITIES, STUDENTS
+from fastapi import HTTPException, status
+
+from app.db.collections import APPLICATIONS, COMPANIES, HIRING_OPPORTUNITIES, INTERVIEW_REPORTS, STUDENTS
 from app.db.mongodb import get_database
 from app.models.application import normalize_application_status
 from app.utils.mongo import serialize_mongo
+from app.utils.object_id import to_object_id
 
 
 REAL_APPLICATION_FILTER = {
@@ -595,5 +598,131 @@ async def get_admin_analytics(start: str | None = None, end: str | None = None) 
             "top_companies": top_companies,
             "role_categories": role_categories,
             "by_month": by_month,
+        }
+    )
+
+
+async def get_admin_student_detail(student_id: str) -> dict:
+    """Everything about one student: profile, pipeline stats, every application
+    (with company/role/status/links/reason), role mix, and interview reports."""
+    db = get_database()
+    try:
+        oid = to_object_id(student_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid student id")
+
+    student = await db[STUDENTS].find_one({"_id": oid})
+    if not student:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+
+    app_rows = await db[APPLICATIONS].aggregate(
+        [
+            {"$match": {"student_id": oid}},
+            {"$sort": {"applied_at": -1, "created_at": -1}},
+            {"$lookup": {"from": COMPANIES, "localField": "company_id", "foreignField": "_id", "as": "co"}},
+            {"$unwind": {"path": "$co", "preserveNullAndEmptyArrays": True}},
+            {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opp"}},
+            {"$unwind": {"path": "$opp", "preserveNullAndEmptyArrays": True}},
+            {
+                "$project": {
+                    "status": _STATUS,
+                    "interested": _INTERESTED,
+                    "applied_at": 1,
+                    "resume_link": {"$ifNull": ["$application_details.submitted_resume_url", "$resume_link"]},
+                    "github_link": {"$ifNull": ["$application_details.github_link", "$github_link"]},
+                    "project_link": {"$ifNull": ["$application_details.project_link", "$project_link"]},
+                    "interest_reason": "$application_details.interest_reason",
+                    "non_interest_reason": "$application_details.non_interest_reason",
+                    "company": "$co.name",
+                    "company_id": "$co._id",
+                    "role": "$opp.role",
+                    "skills": "$opp.must_have_skills",
+                    "opportunity_id": "$opp._id",
+                }
+            },
+        ]
+    ).to_list(length=None)
+
+    stats = {"responses": 0, "interested": 0, "shortlisted": 0, "selected": 0, "declined": 0}
+    role_counts: dict = {}
+    applications = []
+    for a in app_rows:
+        st = a.get("status") or "APPLIED"
+        interested = a.get("interested") is not False
+        stats["responses"] += 1
+        stats["interested" if interested else "declined"] += 1
+        if st in _SHORTLISTED_SET:
+            stats["shortlisted"] += 1
+        if st in _SELECTED_SET:
+            stats["selected"] += 1
+        cat = categorize_role(a.get("role"), a.get("skills"))
+        if interested:
+            role_counts[cat] = role_counts.get(cat, 0) + 1
+        applications.append(
+            {
+                "company": a.get("company") or "Unknown",
+                "company_id": a.get("company_id"),
+                "opportunity_id": a.get("opportunity_id"),
+                "role": a.get("role") or "—",
+                "category": cat,
+                "status": st,
+                "interested": interested,
+                "applied_at": a.get("applied_at"),
+                "resume_link": a.get("resume_link"),
+                "github_link": a.get("github_link"),
+                "project_link": a.get("project_link"),
+                "interest_reason": a.get("interest_reason"),
+                "non_interest_reason": a.get("non_interest_reason"),
+            }
+        )
+    role_breakdown = sorted([{"category": k, "n": v} for k, v in role_counts.items()], key=lambda x: -x["n"])
+
+    reports = await db[INTERVIEW_REPORTS].aggregate(
+        [
+            {"$match": {"student_id": oid}},
+            {"$sort": {"generated_at": -1, "created_at": -1}},
+            {"$lookup": {"from": COMPANIES, "localField": "company_id", "foreignField": "_id", "as": "co"}},
+            {"$unwind": {"path": "$co", "preserveNullAndEmptyArrays": True}},
+            {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opp"}},
+            {"$unwind": {"path": "$opp", "preserveNullAndEmptyArrays": True}},
+            {
+                "$project": {
+                    "overall": 1,
+                    "communication": 1,
+                    "strengths": 1,
+                    "improvements": 1,
+                    "skill_ratings": 1,
+                    "interviewer_feedback": 1,
+                    "visible_to_student": 1,
+                    "generated_at": 1,
+                    "company": "$co.name",
+                    "role": "$opp.role",
+                }
+            },
+        ]
+    ).to_list(length=None)
+
+    return serialize_mongo(
+        {
+            "student": {
+                "id": student["_id"],
+                "name": student.get("name"),
+                "email": student.get("email"),
+                "phone": student.get("phone"),
+                "college_name": student.get("college_name"),
+                "current_city": student.get("current_city"),
+                "degree": student.get("degree"),
+                "department": student.get("department"),
+                "year_of_passing": student.get("year_of_passing"),
+                "resume_link": student.get("resume_link"),
+                "technical_developer_name": student.get("technical_developer_name"),
+                "placed_status": student.get("placed_status"),
+                "external_user_id": student.get("external_user_id"),
+                "created_at": student.get("created_at"),
+            },
+            "stats": stats,
+            "applications": applications,
+            "role_breakdown": role_breakdown,
+            "reports": reports,
         }
     )
