@@ -162,6 +162,63 @@ async def get_admin_dashboard() -> dict:
         ]
     ).to_list(length=None)
 
+    # ---- Overview: application-based placement funnel ----
+    interviewing_count = await db[APPLICATIONS].count_documents(
+        {"current_status": {"$in": ["INTERVIEW_IN_PROGRESS", "INTERVIEW_SCHEDULED", "INTERVIEW_COMPLETED"]}}
+    )
+    dropped_count = await db[APPLICATIONS].count_documents({"current_status": "DROPPED"})
+    awaiting_count = await db[APPLICATIONS].count_documents(
+        {"current_status": "APPLIED", "screening.decision": {"$in": [None, "none"]}}
+    )
+    not_shortlisted_count = await db[APPLICATIONS].count_documents(
+        {"$or": [
+            {"current_status": "NOT_SHORTLISTED"},
+            {"screening.decision": {"$in": ["not_shortlisted", "selected_elsewhere", "resume_not_found"]}},
+        ]}
+    )
+    funnel = [
+        {"key": "applied", "label": "Applied", "sub": "all applications", "n": response_count},
+        {"key": "interested", "label": "Interested", "sub": "student opted in", "n": total_applications},
+        {"key": "shortlisted", "label": "Shortlisted", "sub": "company picked them", "n": shortlisted_count},
+        {"key": "interviewing", "label": "Interviewing", "sub": "in process now", "n": interviewing_count},
+        {"key": "placed", "label": "Selected / joined", "sub": "placed", "n": hired_count},
+    ]
+
+    # ---- Overview: action center (each row also drives a queue) ----
+    missing_shortlist = await db[HIRING_OPPORTUNITIES].count_documents(
+        {"shortlist_imported_at": {"$in": [None]}, "responses_imported_at": {"$ne": None}}
+    )
+    profiles_pending = await db[HIRING_OPPORTUNITIES].count_documents(
+        {
+            "profiles_requested": {"$nin": [None, "", 0, "0"]},
+            "$or": [{"profiles_shared": {"$in": [None, "", 0, "0"]}}, {"profiles_shared": {"$exists": False}}],
+        }
+    )
+    reports_total = await db[INTERVIEW_REPORTS].count_documents({})
+    reports_published = await db[INTERVIEW_REPORTS].count_documents({"visible_to_student": True})
+    report_app_ids = [i for i in await db[INTERVIEW_REPORTS].distinct("application_id") if i]
+    interviewed_no_report = await db[APPLICATIONS].count_documents(
+        {"current_status": "INTERVIEW_IN_PROGRESS", "_id": {"$nin": report_app_ids}}
+    )
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    active_recent = set(await db[APPLICATIONS].distinct("student_id", {"applied_at": {"$gte": cutoff}}))
+    ever_applied = set(await db[APPLICATIONS].distinct("student_id"))
+    inactive_30d = len(ever_applied - active_recent)
+    questions_banked = await db["questions"].count_documents({})
+    placed_students = await db[APPLICATIONS].distinct(
+        "student_id", {"current_status": {"$in": ["SELECTED", "JOINED", "OFFER_ACCEPTED"]}}
+    )
+    placed = len(placed_students)
+
+    action_center = {
+        "missing_shortlist_data": missing_shortlist,
+        "profiles_requested_not_shared": profiles_pending,
+        "reports_unpublished": reports_total - reports_published,
+        "interviewed_no_report": interviewed_no_report,
+        "inactive_30d": inactive_30d,
+    }
+    action_total = sum(action_center.values())
+
     return serialize_mongo(
         {
             "summary": {
@@ -176,6 +233,14 @@ async def get_admin_dashboard() -> dict:
                 "rejected_count": rejected_count,
                 "hired_count": hired_count,
             },
+            "funnel": funnel,
+            "loss": {"dropped": dropped_count, "awaiting": awaiting_count, "not_shortlisted": not_shortlisted_count},
+            "action_center": action_center,
+            "action_total": action_total,
+            "placement": {"placed": placed, "total_students": total_students,
+                          "rate": round(placed / total_students * 100, 1) if total_students else 0},
+            "reports_summary": {"reports": reports_total, "published": reports_published,
+                                "pending": reports_total - reports_published, "questions": questions_banked},
             "status_breakdown": [{"status": item["_id"] or "unknown", "count": item["count"]} for item in status_breakdown],
             "recent_applications": recent_applications,
             "recent_opportunities": recent_opportunities,
@@ -482,31 +547,53 @@ async def get_admin_analytics(start: str | None = None, end: str | None = None) 
         "max": max((e["apps"] for e in per_student), default=0),
     }
 
-    top_ids = sorted(per_student, key=lambda e: (-e["apps"], -e["shortlisted"]))[:10]
-    top_oids = [e["_id"] for e in top_ids]
+    # Every student who applied to more than one opening in the window (not a
+    # top-N cap), most-active first. This is the admin's full activity roster.
+    active = sorted([e for e in per_student if e["apps"] > 1], key=lambda e: (-e["apps"], -e["shortlisted"]))
+    active_oids = [e["_id"] for e in active]
     id_to_name: dict = {}
     apps_by_student: dict = {}
-    if top_oids:
-        students_docs = await db[STUDENTS].find({"_id": {"$in": top_oids}}, {"name": 1}).to_list(length=None)
+    not_shortlisted_by_student: dict = {}
+    if active_oids:
+        students_docs = await db[STUDENTS].find({"_id": {"$in": active_oids}}, {"name": 1}).to_list(length=None)
         id_to_name = {s["_id"]: s for s in students_docs}
         app_rows = await db[APPLICATIONS].aggregate(
             [
-                {"$match": {**in_range, "student_id": {"$in": top_oids}}},
+                {"$match": {**in_range, "student_id": {"$in": active_oids}}},
                 {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opp"}},
                 {"$unwind": {"path": "$opp", "preserveNullAndEmptyArrays": True}},
                 {"$lookup": {"from": COMPANIES, "localField": "company_id", "foreignField": "_id", "as": "co"}},
                 {"$unwind": {"path": "$co", "preserveNullAndEmptyArrays": True}},
-                {"$project": {"student_id": 1, "applied_at": 1, "status": _STATUS, "role": "$opp.role", "skills": "$opp.must_have_skills", "company": "$co.name"}},
+                {"$project": {
+                    "student_id": 1, "applied_at": 1, "status": _STATUS,
+                    "screening_remark": "$screening.remark",
+                    "screening_decision": "$screening.decision",
+                    "shortlist_done": {"$cond": [{"$ifNull": ["$opp.shortlist_imported_at", False]}, True, False]},
+                    "role": "$opp.role", "skills": "$opp.must_have_skills", "company": "$co.name",
+                }},
                 {"$sort": {"applied_at": -1}},
             ]
         ).to_list(length=None)
         for a in app_rows:
+            raw_status = a.get("status") or "APPLIED"
+            decision = a.get("screening_decision") or ""
+            # Admin sees the full picture: waitlisted (a backup, hidden from the
+            # student), an explicit resume-stage reject, or simply not appearing
+            # on an imported shortlist -> all surfaced instead of a bland APPLIED.
+            display = raw_status
+            if raw_status in ("APPLIED", "PROFILE_SHARED"):
+                if decision == "waitlisted":
+                    display = "WAITLISTED"
+                elif decision in ("not_shortlisted", "selected_elsewhere", "resume_not_found") or a.get("shortlist_done"):
+                    display = "NOT_SHORTLISTED"
+                    not_shortlisted_by_student[a["student_id"]] = not_shortlisted_by_student.get(a["student_id"], 0) + 1
             apps_by_student.setdefault(a["student_id"], []).append(
                 {
                     "company": a.get("company") or "Unknown",
                     "role": a.get("role") or "—",
                     "category": categorize_role(a.get("role"), a.get("skills")),
-                    "status": a.get("status") or "APPLIED",
+                    "status": display,
+                    "remark": a.get("screening_remark"),
                     "applied_at": a.get("applied_at"),
                 }
             )
@@ -516,9 +603,10 @@ async def get_admin_analytics(start: str | None = None, end: str | None = None) 
             "name": (id_to_name.get(e["_id"], {}) or {}).get("name") or "Unknown",
             "apps": e["apps"],
             "shortlisted": e["shortlisted"],
+            "not_shortlisted": not_shortlisted_by_student.get(e["_id"], 0),
             "applications": apps_by_student.get(e["_id"], []),
         }
-        for e in top_ids
+        for e in active
     ]
 
     # ---- top companies by applications in window ----

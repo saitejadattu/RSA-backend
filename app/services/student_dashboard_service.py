@@ -73,22 +73,13 @@ async def list_student_applications(student: dict, *, include_not_interested: bo
                 "project_link": {"$ifNull": ["$application_details.project_link", "$project_link"]},
                 "resume_link": {"$ifNull": ["$application_details.submitted_resume_url", "$resume_link"]},
                 "shortlist": 1,
-                # The company's per-candidate remark, shown to the student so they
-                # can act on it. Only surfaced when marked visible_to_student.
-                "screening_remark": {
-                    "$cond": [
-                        {"$eq": ["$screening.visible_to_student", True]},
-                        "$screening.remark",
-                        None,
-                    ]
-                },
-                "screening_decision": {
-                    "$cond": [
-                        {"$eq": ["$screening.visible_to_student", True]},
-                        "$screening.decision",
-                        None,
-                    ]
-                },
+                # Raw screening + whether the opening's shortlist has been
+                # processed. These drive the student-facing outcome computed in
+                # Python below, then are stripped so nothing sensitive (e.g. a
+                # waitlist note) ever reaches the student.
+                "_decision": "$screening.decision",
+                "_remark": "$screening.remark",
+                "_shortlist_done": {"$cond": [{"$ifNull": ["$opportunity.shortlist_imported_at", False]}, True, False]},
                 "not_interested_reason": {
                     "$ifNull": ["$application_details.non_interest_reason", "$not_interested_reason"]
                 },
@@ -112,7 +103,60 @@ async def list_student_applications(student: dict, *, include_not_interested: bo
         },
     ]
     applications = await db[APPLICATIONS].aggregate(pipeline).to_list(length=None)
+    for application in applications:
+        _apply_student_outcome(application)
     return serialize_mongo(applications)
+
+
+# Screening decisions that mean the profile was passed over at the resume stage.
+# "waitlisted" is deliberately NOT here: a waitlisted student is a second-priority
+# backup who may still be pulled in, so the student is never shown that status.
+_REJECT_DECISIONS = {"not_shortlisted", "selected_elsewhere", "resume_not_found"}
+_FORWARD_STATUSES = {"SELECTED", "JOINED", "OFFER_ACCEPTED", "OFFER_RELEASED", "OFFER_PENDING"}
+
+
+def _apply_student_outcome(application: dict) -> None:
+    """Derive the single status a student should see, and gate the remark.
+
+    - waitlisted -> shown as still 'pending' (never 'waitlisted'), remark hidden.
+    - not on the shortlist sheet once it's been imported -> 'not_shortlisted'.
+    - a resume-stage reject remark -> 'not_shortlisted', remark shown.
+    Only reject remarks reach the student; the raw fields are stripped here.
+    """
+    status = str(application.get("status") or "APPLIED").upper()
+    decision = str(application.get("_decision") or "").lower()
+    shortlist_done = bool(application.get("_shortlist_done"))
+    remark = application.get("_remark")
+
+    if application.get("is_interested") is False or status in {"DROPPED", "NOT_INTERESTED"}:
+        outcome = "declined"
+    elif status == "INTERVIEW_COMPLETED":
+        outcome = "interview_done"
+    elif status == "INTERVIEW_NOT_ATTENDED":
+        outcome = "not_attended"
+    elif "INTERVIEW" in status:
+        outcome = "interviewing"
+    elif status == "SHORTLISTED":
+        outcome = "shortlisted"
+    elif status in _FORWARD_STATUSES:
+        outcome = "selected"
+    elif status == "NOT_SHORTLISTED":
+        outcome = "not_shortlisted"
+    elif decision == "waitlisted":
+        outcome = "pending"
+    elif decision in _REJECT_DECISIONS:
+        outcome = "not_shortlisted"
+    elif shortlist_done and status == "APPLIED":
+        outcome = "not_shortlisted"
+    else:
+        outcome = "pending"
+
+    show_remark = outcome == "not_shortlisted" and decision in _REJECT_DECISIONS
+    application["student_outcome"] = outcome
+    application["screening_remark"] = remark if show_remark else None
+    application["screening_decision"] = decision if show_remark else None
+    for key in ("_decision", "_remark", "_shortlist_done"):
+        application.pop(key, None)
 
 
 def build_summary(applications: list[dict]) -> dict:

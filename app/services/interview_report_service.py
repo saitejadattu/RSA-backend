@@ -634,7 +634,13 @@ def _build_report_answers(report: dict, key_to_id: dict[str, Any]) -> list[dict[
 # interview happened, so these advance. Anything further along (SELECTED,
 # OFFER_*, JOINED) or already closed (REJECTED, DROPPED) is left alone - a
 # re-run must never drag someone who already has an offer back to "in progress".
-ADVANCEABLE_STATUSES = {"APPLIED", "PROFILE_SHARED", "SHORTLISTED", "INTERVIEW_SCHEDULED"}
+# A student appearing in the transcript can be promoted from any of these.
+ADVANCEABLE_STATUSES = {"APPLIED", "PROFILE_SHARED", "SHORTLISTED", "INTERVIEW_SCHEDULED",
+                        "INTERVIEW_IN_PROGRESS", "INTERVIEW_NOT_ATTENDED"}
+# Shortlisted candidates expected to interview; if they never appear in the
+# transcript they are marked not-attended (a later transcript can still promote
+# them, since INTERVIEW_NOT_ATTENDED is advanceable above).
+EXPECTED_TO_INTERVIEW = {"SHORTLISTED", "INTERVIEW_SCHEDULED"}
 
 # Their own vocabulary (see hiring_opportunities.company_status). Only an
 # undecided opening moves; a decided one (Hired / Not Hired / Drop / cv
@@ -643,41 +649,70 @@ OPPORTUNITY_IN_PROGRESS = "Hiring-in-progress"
 OPPORTUNITY_OPEN_STATUSES = {None, "", "Yet To Schedule Interviews"}
 
 
+async def _record_status(db, *, application, new_status, reason, now) -> None:
+    """Move one application to new_status and log the change for the audit trail."""
+    old_status = application.get("current_status")
+    await db[APPLICATIONS].update_one(
+        {"_id": application["_id"]},
+        {"$set": {"current_status": new_status, "updated_at": now}},
+    )
+    await db[STATUS_HISTORY].insert_one(
+        {
+            "application_id": application["_id"],
+            "student_id": application.get("student_id"),
+            "company_id": application.get("company_id"),
+            "opportunity_id": application.get("opportunity_id"),
+            "old_status": old_status,
+            "new_status": new_status,
+            "reason": reason,
+            "notes": None,
+            "changed_by": None,
+            "changed_by_role": "system",
+            "source": "interview_analysis",
+            "created_at": now,
+        }
+    )
+
+
 async def _advance_after_interview(db, *, session, student_ids: list, now) -> dict[str, Any]:
-    """Move interviewed students forward and mark the opening as in progress."""
+    """After a transcript is analysed, split shortlisted candidates by who showed:
+
+    - appeared in the transcript      -> INTERVIEW_COMPLETED (awaiting the
+      company's final call, which an admin records manually);
+    - shortlisted but did NOT appear  -> INTERVIEW_NOT_ATTENDED.
+
+    A decided status (Selected / Joined / Dropped / offers) is never overwritten.
+    """
+    interviewed = {sid for sid in student_ids if sid}
+    opportunity_id = session.get("opportunity_id")
+
     advanced: list[str] = []
-    for student_id in student_ids:
+    for student_id in interviewed:
         application = await db[APPLICATIONS].find_one(
-            {"student_id": student_id, "opportunity_id": session.get("opportunity_id")},
+            {"student_id": student_id, "opportunity_id": opportunity_id},
             {"current_status": 1, "student_id": 1, "company_id": 1, "opportunity_id": 1},
         )
         if not application:
             continue
-        old_status = application.get("current_status")
-        if old_status not in ADVANCEABLE_STATUSES:
+        if application.get("current_status") not in ADVANCEABLE_STATUSES:
             continue
-
-        await db[APPLICATIONS].update_one(
-            {"_id": application["_id"]},
-            {"$set": {"current_status": "INTERVIEW_IN_PROGRESS", "updated_at": now}},
-        )
-        await db[STATUS_HISTORY].insert_one(
-            {
-                "application_id": application["_id"],
-                "student_id": application["student_id"],
-                "company_id": application.get("company_id"),
-                "opportunity_id": application.get("opportunity_id"),
-                "old_status": old_status,
-                "new_status": "INTERVIEW_IN_PROGRESS",
-                "reason": "Interview transcript analysed",
-                "notes": None,
-                "changed_by": None,
-                "changed_by_role": "system",
-                "source": "interview_analysis",
-                "created_at": now,
-            }
-        )
+        await _record_status(db, application=application, new_status="INTERVIEW_COMPLETED",
+                             reason="Interview transcript analysed — awaiting company response", now=now)
         advanced.append(str(application["_id"]))
+
+    # Shortlisted for this opening but absent from the transcript.
+    not_attended = 0
+    async for application in db[APPLICATIONS].find(
+        {
+            "opportunity_id": opportunity_id,
+            "current_status": {"$in": list(EXPECTED_TO_INTERVIEW)},
+            "student_id": {"$nin": list(interviewed)},
+        },
+        {"current_status": 1, "student_id": 1, "company_id": 1, "opportunity_id": 1},
+    ):
+        await _record_status(db, application=application, new_status="INTERVIEW_NOT_ATTENDED",
+                             reason="Shortlisted but did not appear in the interview transcript", now=now)
+        not_attended += 1
 
     opportunity_updated = False
     opportunity = await db[HIRING_OPPORTUNITIES].find_one(
@@ -690,7 +725,11 @@ async def _advance_after_interview(db, *, session, student_ids: list, now) -> di
         )
         opportunity_updated = True
 
-    return {"applications_advanced": len(advanced), "opportunity_status_updated": opportunity_updated}
+    return {
+        "applications_advanced": len(advanced),
+        "not_attended": not_attended,
+        "opportunity_status_updated": opportunity_updated,
+    }
 
 
 async def analyze_session(session_id: str) -> dict:

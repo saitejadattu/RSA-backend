@@ -143,7 +143,12 @@ def extract_skills(row: dict[str, str | None]) -> dict[str, dict[str, Any]]:
 def parse_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None
-    for fmt in ("%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%d-%b-%Y", "%b-%d-%Y"):
+    for fmt in (
+        "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M", "%m/%d/%Y",
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",  # ISO platform export
+        "%B %d, %Y, %I:%M %p", "%B %d, %Y",                 # "July 24, 2026, 9:42 PM"
+        "%d-%b-%Y", "%b-%d-%Y",
+    ):
         try:
             return datetime.strptime(value.strip(), fmt).replace(tzinfo=timezone.utc)
         except ValueError:
@@ -987,6 +992,63 @@ async def import_responses(
 # --------------------------------------------------------------------------
 
 
+# Screening-stage statuses a shortlist decision is allowed to overwrite. An
+# interview/offer/joined/dropped status is a later, decided state and is left
+# alone. NOT_SHORTLISTED is included so a re-import re-affirms it idempotently.
+_SCREENING_STAGE = ["APPLIED", "PROFILE_SHARED", "SHORTLISTED", "NOT_SHORTLISTED"]
+
+
+async def _reconcile_shortlist(db, *, opportunity, company, shortlisted_ids, now, confirm) -> int:
+    """Once a shortlist is imported it is authoritative for the screening stage:
+    every applicant on this opening who is NOT on the sheet is set to
+    NOT_SHORTLISTED (this is also how a re-import corrects a wrong earlier
+    shortlist). A backup 'waitlisted' candidate is left untouched, and interview/
+    offer stages are never pulled back. Runs only when the sheet shortlisted at
+    least one person, so an empty or failed pull can't blank a shortlist.
+
+    Returns the count of applications changed (or that would be, in preview).
+    """
+    if not shortlisted_ids:
+        return 0
+    stale = await db[APPLICATIONS].find(
+        {
+            "opportunity_id": opportunity["_id"],
+            "current_status": {"$in": ["APPLIED", "PROFILE_SHARED", "SHORTLISTED"]},
+            "student_id": {"$nin": list(shortlisted_ids)},
+            "screening.decision": {"$ne": "waitlisted"},
+        }
+    ).to_list(length=None)
+    if not confirm:
+        return len(stale)
+    for app in stale:
+        old_status = app.get("current_status")
+        update = {
+            "$set": {
+                "current_status": "NOT_SHORTLISTED",
+                "final_status": final_status_for("NOT_SHORTLISTED", interested=True),
+                "updated_at": now,
+            }
+        }
+        if old_status == "SHORTLISTED":
+            update["$unset"] = {"shortlisted_at": ""}
+        await db[APPLICATIONS].update_one({"_id": app["_id"]}, update)
+        await db[STATUS_HISTORY].insert_one({
+            "application_id": app["_id"],
+            "student_id": app.get("student_id"),
+            "company_id": company["_id"],
+            "opportunity_id": opportunity["_id"],
+            "old_status": old_status,
+            "new_status": "NOT_SHORTLISTED",
+            "reason": "Not on the imported shortlist for this opening",
+            "notes": None,
+            "changed_by": None,
+            "changed_by_role": "admin",
+            "source": "shortlist_reconcile",
+            "created_at": now,
+        })
+    return len(stale)
+
+
 async def _import_company_decisions(
     *, opportunity_id: str, rows: list[dict[str, str | None]], field_map: dict[str, str | None], confirm: bool
 ) -> dict:
@@ -1003,6 +1065,7 @@ async def _import_company_decisions(
     applicants = await build_applicant_index(db, opportunity["_id"])
 
     preview: list[dict[str, Any]] = []
+    shortlisted_ids: set = set()
     counts = {
         "rows": len(rows),
         "students_matched": 0,
@@ -1013,6 +1076,7 @@ async def _import_company_decisions(
         "other": 0,
         "unmatched": 0,
         "no_remark": 0,
+        "removed_from_shortlist": 0,
     }
 
     for index, row in enumerate(rows, start=1):
@@ -1061,6 +1125,10 @@ async def _import_company_decisions(
             counts["no_remark"] += 1
         else:
             counts[decision] = counts.get(decision, 0) + 1
+        # Everyone this sheet shortlists forms the authoritative set for the
+        # reconcile below; anyone SHORTLISTED but absent from it gets demoted.
+        if decision == "shortlisted":
+            shortlisted_ids.add(student["_id"])
 
         if not confirm:
             preview.append(entry)
@@ -1102,6 +1170,11 @@ async def _import_company_decisions(
                 "created_at": now,
             })
         preview.append(entry)
+
+    counts["removed_from_shortlist"] = await _reconcile_shortlist(
+        db, opportunity=opportunity, company=company,
+        shortlisted_ids=shortlisted_ids, now=now, confirm=confirm,
+    )
 
     if confirm and (counts["shortlisted"] or counts["not_shortlisted"] or counts["selected_elsewhere"]):
         await db[HIRING_OPPORTUNITIES].update_one(
@@ -1154,8 +1227,10 @@ async def import_shortlist(*, opportunity_id: str, raw_text: str, confirm: bool 
         "applications_to_mark": 0,
         "ambiguous": 0,
         "unmatched": 0,
+        "removed_from_shortlist": 0,
     }
     willing = {"interested": 0, "not_interested": 0, "no_response": 0}
+    shortlisted_ids: set = set()
 
     applicants = await build_applicant_index(db, opportunity["_id"])
 
@@ -1209,6 +1284,7 @@ async def import_shortlist(*, opportunity_id: str, raw_text: str, confirm: bool 
         entry["action"] = "mark_shortlisted"
         entry["current_status"] = existing_application.get("current_status")
         counts["applications_to_mark"] += 1
+        shortlisted_ids.add(student["_id"])
 
         if not confirm:
             preview.append(entry)
@@ -1262,6 +1338,11 @@ async def import_shortlist(*, opportunity_id: str, raw_text: str, confirm: bool 
                 "created_at": now,
             })
         preview.append(entry)
+
+    counts["removed_from_shortlist"] = await _reconcile_shortlist(
+        db, opportunity=opportunity, company=company,
+        shortlisted_ids=shortlisted_ids, now=now, confirm=confirm,
+    )
 
     if confirm and counts["applications_to_mark"]:
         await db[HIRING_OPPORTUNITIES].update_one(

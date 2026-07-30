@@ -9,6 +9,12 @@ APPLICATION_STATUSES = {
     "NOT_SHORTLISTED",
     "INTERVIEW_SCHEDULED",
     "INTERVIEW_IN_PROGRESS",
+    # Interview happened (student appeared in the transcript), awaiting the
+    # company's final call, which an admin records manually.
+    "INTERVIEW_COMPLETED",
+    # Student was shortlisted for the opening but did not appear in the
+    # interview transcript.
+    "INTERVIEW_NOT_ATTENDED",
     "SELECTED",
     "OFFER_PENDING",
     "OFFER_RELEASED",
@@ -31,6 +37,10 @@ LEGACY_STATUS_MAP = {
     "interview_scheduled": "INTERVIEW_SCHEDULED",
     "in_progress": "INTERVIEW_IN_PROGRESS",
     "interview_in_progress": "INTERVIEW_IN_PROGRESS",
+    "interview_completed": "INTERVIEW_COMPLETED",
+    "interview_done": "INTERVIEW_COMPLETED",
+    "interview_not_attended": "INTERVIEW_NOT_ATTENDED",
+    "not_attended": "INTERVIEW_NOT_ATTENDED",
     "selected": "SELECTED",
     "offer_pending": "OFFER_PENDING",
     "offer_released": "OFFER_RELEASED",
