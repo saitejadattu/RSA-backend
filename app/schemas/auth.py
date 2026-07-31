@@ -32,7 +32,8 @@ class AdminLoginRequest(BaseModel):
 
 class AdminLoginResponse(BaseModel):
     status: str
-    access_token: str
+    access_token: str | None = None
+    reset_token: str | None = None
     token_type: str = "bearer"
     message: str
 

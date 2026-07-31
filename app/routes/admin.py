@@ -11,6 +11,7 @@ from app.services.admin_dashboard_service import (
     get_admin_analytics,
     get_admin_dashboard,
     get_admin_student_detail,
+    list_admin_reports,
     list_admin_students,
     list_recent_applications,
 )
@@ -97,6 +98,13 @@ async def bank(
     """Deduplicated question bank: one row per distinct question with how often
     it was asked and which companies asked it."""
     return await question_bank(technical_only=technical_only, limit=limit)
+
+
+@router.get("/reports")
+async def reports_list(published: bool | None = None) -> list[dict]:
+    """All interview reports (newest first) with student/company/role and the full
+    report body. published=true -> shared only, published=false -> pending only."""
+    return await list_admin_reports(published=published)
 
 
 @router.patch("/reports/{report_id}/visibility")

@@ -13,7 +13,7 @@ from app.config.constants import (
     TOKEN_TYPE_PASSWORD_RESET,
 )
 from app.config.settings import get_settings
-from app.db.collections import STUDENTS
+from app.db.collections import ADMINS, STUDENTS
 from app.db.mongodb import get_database
 from app.services.student_service import find_student_by_identifier
 from app.utils.jwt import create_token, decode_token
@@ -41,6 +41,28 @@ def _admin_access_token() -> str:
         subject=ADMIN_EMAIL,
         token_type=TOKEN_TYPE_ACCESS,
         expires_delta=timedelta(minutes=settings.jwt_access_token_expire_minutes),
+        extra_claims={"role": ROLE_ADMIN, "name": "Admin"},
+    )
+
+
+def _admin_token_for(admin: dict) -> str:
+    """Access token that carries the admin's identity, so every action they take
+    can be attributed to them in the audit trail."""
+    settings = get_settings()
+    return create_token(
+        subject=str(admin["_id"]),
+        token_type=TOKEN_TYPE_ACCESS,
+        expires_delta=timedelta(minutes=settings.jwt_access_token_expire_minutes),
+        extra_claims={"role": ROLE_ADMIN, "name": admin.get("name"), "email": admin.get("email")},
+    )
+
+
+def _admin_reset_token(admin: dict) -> str:
+    settings = get_settings()
+    return create_token(
+        subject=str(admin["_id"]),
+        token_type=TOKEN_TYPE_PASSWORD_RESET,
+        expires_delta=timedelta(minutes=settings.jwt_password_reset_expire_minutes),
         extra_claims={"role": ROLE_ADMIN},
     )
 
@@ -97,12 +119,33 @@ async def login(identifier: str, password: str) -> dict:
 
 
 async def admin_login(email: str, password: str) -> dict:
-    if email.strip().lower() != ADMIN_EMAIL or password != ADMIN_PASSWORD:
+    email_norm = email.strip().lower()
+
+    # Legacy shared admin, kept as a fallback so nothing breaks during rollout.
+    if email_norm == ADMIN_EMAIL and password == ADMIN_PASSWORD:
+        return {
+            "status": AUTH_STATUS_AUTHENTICATED,
+            "access_token": _admin_access_token(),
+            "message": "Admin login successful",
+        }
+
+    # Per-admin accounts (seeded via scripts/seed_admins.py).
+    db = get_database()
+    admin = await db[ADMINS].find_one({"email": email_norm})
+    if admin is None or not admin.get("password_hash") or not verify_password(password, admin["password_hash"]):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin credentials")
+
+    # First login (or a re-issued temp password): force them to set their own.
+    if admin.get("force_password_reset") or not admin.get("is_password_set"):
+        return {
+            "status": AUTH_STATUS_PASSWORD_RESET_REQUIRED,
+            "reset_token": _admin_reset_token(admin),
+            "message": "Set your own password to continue",
+        }
 
     return {
         "status": AUTH_STATUS_AUTHENTICATED,
-        "access_token": _admin_access_token(),
+        "access_token": _admin_token_for(admin),
         "message": "Admin login successful",
     }
 
@@ -110,24 +153,28 @@ async def admin_login(email: str, password: str) -> dict:
 async def set_password(reset_token: str, new_password: str) -> dict:
     try:
         payload = decode_token(reset_token, expected_type=TOKEN_TYPE_PASSWORD_RESET)
-        student_id = to_object_id(payload["sub"])
+        subject_id = to_object_id(payload["sub"])
     except (KeyError, ValueError):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid reset token")
 
     db = get_database()
     now = datetime.now(timezone.utc)
-    result = await db[STUDENTS].update_one(
-        {"_id": student_id, "role": ROLE_STUDENT},
-        {
-            "$set": {
-                "password_hash": hash_password(new_password),
-                "is_password_set": True,
-                "force_password_reset": False,
-                "password_updated_at": now,
-                "updated_at": now,
-            }
-        },
-    )
+    fields = {
+        "password_hash": hash_password(new_password),
+        "is_password_set": True,
+        "force_password_reset": False,
+        "password_updated_at": now,
+        "updated_at": now,
+    }
+    # The reset token carries the role, so the same endpoint serves admins and
+    # students without leaking one into the other's collection.
+    if payload.get("role") == ROLE_ADMIN:
+        result = await db[ADMINS].update_one({"_id": subject_id}, {"$set": fields})
+        if result.matched_count == 0:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Admin not found")
+        return {"message": "Password updated successfully"}
+
+    result = await db[STUDENTS].update_one({"_id": subject_id, "role": ROLE_STUDENT}, {"$set": fields})
     if result.matched_count == 0:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
     return {"message": "Password updated successfully"}

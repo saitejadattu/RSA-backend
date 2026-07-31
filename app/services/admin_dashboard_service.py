@@ -814,3 +814,38 @@ async def get_admin_student_detail(student_id: str) -> dict:
             "reports": reports,
         }
     )
+
+
+async def list_admin_reports(*, published: bool | None = None, limit: int = 300) -> list[dict]:
+    """All interview reports for the admin reports view: newest first, joined to
+    student / company / role, with the full report body (admin sees score too).
+    published=True -> only shared, published=False -> only pending."""
+    db = get_database()
+    match: dict = {}
+    if published is True:
+        match["visible_to_student"] = True
+    elif published is False:
+        match["visible_to_student"] = {"$ne": True}
+    reports = await db[INTERVIEW_REPORTS].aggregate(
+        [
+            {"$match": match},
+            {"$sort": {"generated_at": -1, "created_at": -1}},
+            {"$limit": limit},
+            {"$lookup": {"from": STUDENTS, "localField": "student_id", "foreignField": "_id", "as": "st"}},
+            {"$unwind": {"path": "$st", "preserveNullAndEmptyArrays": True}},
+            {"$lookup": {"from": COMPANIES, "localField": "company_id", "foreignField": "_id", "as": "co"}},
+            {"$unwind": {"path": "$co", "preserveNullAndEmptyArrays": True}},
+            {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opp"}},
+            {"$unwind": {"path": "$opp", "preserveNullAndEmptyArrays": True}},
+            {
+                "$project": {
+                    "overall": 1, "communication": 1, "strengths": 1, "improvements": 1,
+                    "skill_ratings": 1, "interviewer_feedback": 1, "answers": 1,
+                    "visible_to_student": 1, "generated_at": 1, "application_id": 1,
+                    "company": "$co.name", "role": "$opp.role",
+                    "student": {"id": "$st._id", "name": "$st.name"},
+                }
+            },
+        ]
+    ).to_list(length=None)
+    return serialize_mongo(reports)
