@@ -37,7 +37,11 @@ class Settings(BaseSettings):
         "http://localhost:5174",
         "http://127.0.0.1:5174",
     ]
-    cors_origin_regex: str | None = r"^http://(localhost|127\.0\.0\.1):\d+$"
+    # Allow local dev (any port) and the deployed Render frontends
+    # (e.g. https://rsa-frontend-38iw.onrender.com). Override via env if needed.
+    cors_origin_regex: str | None = (
+        r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$|^https://[a-z0-9-]+\.onrender\.com$"
+    )
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
