@@ -1,3 +1,4 @@
+import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -32,35 +33,37 @@ NOT_INTERESTED_FILTER = {
 async def get_admin_dashboard() -> dict:
     db = get_database()
 
-    total_students = await db[STUDENTS].count_documents({})
-    total_companies = await db[COMPANIES].count_documents({})
-    total_opportunities = await db[HIRING_OPPORTUNITIES].count_documents({})
-    response_count = await db[APPLICATIONS].count_documents({})
-    total_applications = await db[APPLICATIONS].count_documents(REAL_APPLICATION_FILTER)
-    not_interested_count = await db[APPLICATIONS].count_documents(NOT_INTERESTED_FILTER)
-    shortlisted_count = await db[APPLICATIONS].count_documents(
-        {"$or": [{"current_status": "SHORTLISTED"}, {"current_status": {"$exists": False}, "status": "shortlisted"}]}
-    )
-    rejected_count = await db[APPLICATIONS].count_documents(
-        {"$or": [{"current_status": "REJECTED"}, {"current_status": {"$exists": False}, "status": "rejected"}]}
-    )
-    hired_count = await db[APPLICATIONS].count_documents(
-        {
-            "$or": [
-                {"current_status": {"$in": ["SELECTED", "JOINED"]}},
-                {"current_status": {"$exists": False}, "status": "hired"},
-            ]
-        }
+    # These are all independent, so fire them concurrently (one round-trip wave
+    # instead of nine sequential ones — Atlas latency dominated the old path).
+    (
+        total_students, total_companies, total_opportunities, response_count,
+        total_applications, not_interested_count, shortlisted_count, rejected_count, hired_count,
+    ) = await asyncio.gather(
+        db[STUDENTS].count_documents({}),
+        db[COMPANIES].count_documents({}),
+        db[HIRING_OPPORTUNITIES].count_documents({}),
+        db[APPLICATIONS].count_documents({}),
+        db[APPLICATIONS].count_documents(REAL_APPLICATION_FILTER),
+        db[APPLICATIONS].count_documents(NOT_INTERESTED_FILTER),
+        db[APPLICATIONS].count_documents(
+            {"$or": [{"current_status": "SHORTLISTED"}, {"current_status": {"$exists": False}, "status": "shortlisted"}]}
+        ),
+        db[APPLICATIONS].count_documents(
+            {"$or": [{"current_status": "REJECTED"}, {"current_status": {"$exists": False}, "status": "rejected"}]}
+        ),
+        db[APPLICATIONS].count_documents(
+            {"$or": [{"current_status": {"$in": ["SELECTED", "JOINED"]}}, {"current_status": {"$exists": False}, "status": "hired"}]}
+        ),
     )
 
-    status_breakdown = await db[APPLICATIONS].aggregate(
+    status_task = db[APPLICATIONS].aggregate(
         [
             {"$group": {"_id": {"$ifNull": ["$current_status", "$status"]}, "count": {"$sum": 1}}},
             {"$sort": {"count": -1, "_id": 1}},
         ]
     ).to_list(length=None)
 
-    recent_applications = await list_recent_applications(limit=8)
+    recent_apps_task = list_recent_applications(limit=8)
     opportunity_pipeline = [
         {
             "$lookup": {
@@ -134,9 +137,9 @@ async def get_admin_dashboard() -> dict:
         {"$sort": {"opportunity_received_at": -1, "updated_at": -1}},
         {"$limit": 500},
     ]
-    recent_opportunities = await db[HIRING_OPPORTUNITIES].aggregate(opportunity_pipeline).to_list(length=None)
+    recent_opps_task = db[HIRING_OPPORTUNITIES].aggregate(opportunity_pipeline).to_list(length=None)
 
-    repeated_companies = await db[HIRING_OPPORTUNITIES].aggregate(
+    repeated_task = db[HIRING_OPPORTUNITIES].aggregate(
         [
             {
                 "$group": {
@@ -162,20 +165,54 @@ async def get_admin_dashboard() -> dict:
         ]
     ).to_list(length=None)
 
-    # ---- Overview: application-based placement funnel ----
-    interviewing_count = await db[APPLICATIONS].count_documents(
-        {"current_status": {"$in": ["INTERVIEW_IN_PROGRESS", "INTERVIEW_SCHEDULED", "INTERVIEW_COMPLETED"]}}
+    # Run the four aggregations concurrently rather than one after another.
+    status_breakdown, recent_applications, recent_opportunities, repeated_companies = await asyncio.gather(
+        status_task, recent_apps_task, recent_opps_task, repeated_task
     )
-    dropped_count = await db[APPLICATIONS].count_documents({"current_status": "DROPPED"})
-    awaiting_count = await db[APPLICATIONS].count_documents(
-        {"current_status": "APPLIED", "screening.decision": {"$in": [None, "none"]}}
+
+    # ---- Overview funnel + action center: fire every read concurrently ----
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    (
+        interviewing_count, dropped_count, awaiting_count, not_shortlisted_count,
+        missing_shortlist, profiles_pending, reports_total, reports_published,
+        report_app_ids_raw, active_recent_list, ever_applied_list, questions_banked,
+        placed_students,
+    ) = await asyncio.gather(
+        db[APPLICATIONS].count_documents(
+            {"current_status": {"$in": ["INTERVIEW_IN_PROGRESS", "INTERVIEW_SCHEDULED", "INTERVIEW_COMPLETED"]}}
+        ),
+        db[APPLICATIONS].count_documents({"current_status": "DROPPED"}),
+        db[APPLICATIONS].count_documents({"current_status": "APPLIED", "screening.decision": {"$in": [None, "none"]}}),
+        db[APPLICATIONS].count_documents(
+            {"$or": [
+                {"current_status": "NOT_SHORTLISTED"},
+                {"screening.decision": {"$in": ["not_shortlisted", "selected_elsewhere", "resume_not_found"]}},
+            ]}
+        ),
+        db[HIRING_OPPORTUNITIES].count_documents(
+            {"shortlist_imported_at": {"$in": [None]}, "responses_imported_at": {"$ne": None}}
+        ),
+        db[HIRING_OPPORTUNITIES].count_documents(
+            {
+                "profiles_requested": {"$nin": [None, "", 0, "0"]},
+                "$or": [{"profiles_shared": {"$in": [None, "", 0, "0"]}}, {"profiles_shared": {"$exists": False}}],
+            }
+        ),
+        db[INTERVIEW_REPORTS].count_documents({}),
+        db[INTERVIEW_REPORTS].count_documents({"visible_to_student": True}),
+        db[INTERVIEW_REPORTS].distinct("application_id"),
+        db[APPLICATIONS].distinct("student_id", {"applied_at": {"$gte": cutoff}}),
+        db[APPLICATIONS].distinct("student_id"),
+        db["questions"].count_documents({}),
+        db[APPLICATIONS].distinct("student_id", {"current_status": {"$in": ["SELECTED", "JOINED", "OFFER_ACCEPTED"]}}),
     )
-    not_shortlisted_count = await db[APPLICATIONS].count_documents(
-        {"$or": [
-            {"current_status": "NOT_SHORTLISTED"},
-            {"screening.decision": {"$in": ["not_shortlisted", "selected_elsewhere", "resume_not_found"]}},
-        ]}
+    report_app_ids = [i for i in report_app_ids_raw if i]
+    interviewed_no_report = await db[APPLICATIONS].count_documents(
+        {"current_status": "INTERVIEW_IN_PROGRESS", "_id": {"$nin": report_app_ids}}
     )
+    inactive_30d = len(set(ever_applied_list) - set(active_recent_list))
+    placed = len(placed_students)
+
     funnel = [
         {"key": "applied", "label": "Applied", "sub": "all applications", "n": response_count},
         {"key": "interested", "label": "Interested", "sub": "student opted in", "n": total_applications},
@@ -183,32 +220,6 @@ async def get_admin_dashboard() -> dict:
         {"key": "interviewing", "label": "Interviewing", "sub": "in process now", "n": interviewing_count},
         {"key": "placed", "label": "Selected / joined", "sub": "placed", "n": hired_count},
     ]
-
-    # ---- Overview: action center (each row also drives a queue) ----
-    missing_shortlist = await db[HIRING_OPPORTUNITIES].count_documents(
-        {"shortlist_imported_at": {"$in": [None]}, "responses_imported_at": {"$ne": None}}
-    )
-    profiles_pending = await db[HIRING_OPPORTUNITIES].count_documents(
-        {
-            "profiles_requested": {"$nin": [None, "", 0, "0"]},
-            "$or": [{"profiles_shared": {"$in": [None, "", 0, "0"]}}, {"profiles_shared": {"$exists": False}}],
-        }
-    )
-    reports_total = await db[INTERVIEW_REPORTS].count_documents({})
-    reports_published = await db[INTERVIEW_REPORTS].count_documents({"visible_to_student": True})
-    report_app_ids = [i for i in await db[INTERVIEW_REPORTS].distinct("application_id") if i]
-    interviewed_no_report = await db[APPLICATIONS].count_documents(
-        {"current_status": "INTERVIEW_IN_PROGRESS", "_id": {"$nin": report_app_ids}}
-    )
-    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
-    active_recent = set(await db[APPLICATIONS].distinct("student_id", {"applied_at": {"$gte": cutoff}}))
-    ever_applied = set(await db[APPLICATIONS].distinct("student_id"))
-    inactive_30d = len(ever_applied - active_recent)
-    questions_banked = await db["questions"].count_documents({})
-    placed_students = await db[APPLICATIONS].distinct(
-        "student_id", {"current_status": {"$in": ["SELECTED", "JOINED", "OFFER_ACCEPTED"]}}
-    )
-    placed = len(placed_students)
 
     action_center = {
         "missing_shortlist_data": missing_shortlist,
