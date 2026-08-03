@@ -28,7 +28,7 @@ from app.models.interview_report import (
     question_key,
     utc_now,
 )
-from app.services.ai_service import analyze_candidate_block
+from app.services.ai_service import analyze_candidate_block, analyze_company_summary
 from app.services.transcript_service import (
     build_speaker_map,
     candidate_blocks,
@@ -852,6 +852,10 @@ async def analyze_session(session_id: str) -> dict:
             # The interviewer's own words, kept separate from anything the model
             # generated - it is the most trustworthy feedback in the room.
             "interviewer_feedback": (report.get("interviewer_feedback") or "").strip() or None,
+            # Admin-only: how well they met the interviewer's bar + how to coach
+            # them for next time. Not projected to the student endpoint.
+            "interviewer_satisfaction": (report.get("interviewer_satisfaction") or "").strip() or None,
+            "coaching_note": (report.get("coaching_note") or "").strip() or None,
             "ai_model": analysis.get("_model"),
             "ai_provider": analysis.get("_provider"),
             "ai_status": "completed",
@@ -883,6 +887,22 @@ async def analyze_session(session_id: str) -> dict:
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Analysis failed for every candidate: {failures}",
         )
+
+    # Company-level pass over the whole session (what the company looked for).
+    # Supplementary: a failure here must never fail the per-student reports.
+    try:
+        company = await analyze_company_summary(transcript_text=transcript_to_text(segments), context=context)
+        await db[INTERVIEW_SESSIONS].update_one(
+            {"_id": session_object_id},
+            {"$set": {"company_expectations": {
+                "expectations": (company.get("expectations") or "").strip() or None,
+                "focus": [f.strip() for f in (company.get("focus") or []) if (f or "").strip()][:6],
+                "generated_at": utc_now(),
+                "ai_model": company.get("_model"),
+            }}},
+        )
+    except Exception:
+        pass
 
     # The interview demonstrably happened, so move the pipeline forward.
     advanced = await _advance_after_interview(

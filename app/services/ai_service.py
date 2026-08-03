@@ -106,6 +106,12 @@ TASK 2 - REPORT for this candidate only. Do this only after TASK 1 is complete.
   * skill_ratings: 1-5, ONLY for skills actually evidenced.
   * interviewer_feedback: if the interviewer gave the candidate verbal feedback
     or advice, quote it as closely as the transcript allows. Empty string if none.
+  * interviewer_satisfaction: 1-2 sentences, FOR ADMINS ONLY, on how well this
+    candidate met what the interviewer was actually looking for - where they
+    satisfied the bar and where they fell short. Do NOT address the student.
+  * coaching_note: 1-2 sentences, FOR THE PLACEMENT TEAM, on how to prepare and
+    train this student for future interviews - concrete next steps. Do NOT
+    address the student.
 
 VOICE - summary, strengths and improvements speak DIRECTLY to the student. Use
 "you", never "the candidate", "they/them", or the student's name. Keep it simple
@@ -165,12 +171,15 @@ BASE_SCHEMA: dict[str, Any] = {
             "required": [
                 "summary", "score", "verdict", "strengths", "improvements",
                 "answers", "skill_ratings", "communication", "interviewer_feedback",
+                "interviewer_satisfaction", "coaching_note",
             ],
             "properties": {
                 "summary": {"type": "string"},
                 "score": {"type": "number"},
                 "verdict": {"type": "string", "enum": ["strong", "average", "weak"]},
                 "interviewer_feedback": {"type": "string"},
+                "interviewer_satisfaction": {"type": "string"},
+                "coaching_note": {"type": "string"},
                 "strengths": {"type": "array", "items": {"type": "string"}},
                 "improvements": {
                     "type": "array",
@@ -249,6 +258,35 @@ GEMINI_SCHEMA = _strip_for_gemini(copy.deepcopy(BASE_SCHEMA))
 OPENAI_SCHEMA = {"name": "interview_analysis", "strict": True, "schema": BASE_SCHEMA}
 
 
+# One company-level pass over the whole session (all candidates): what the
+# company was looking for, for the placement team.
+COMPANY_SYSTEM_PROMPT = """You summarise what a company was looking for across an ENTIRE interview session (one or more candidates), for a placement team.
+
+Read the whole transcript and produce:
+  * expectations: 2-4 sentences on what THIS company/interviewer clearly valued in
+    candidates - the skills, depth and qualities they probed for and rewarded.
+    Ground it in the questions asked and the interviewer's reactions. Write for the
+    placement team (about the company), NOT addressed to any student.
+  * focus: 2-5 short phrases naming what the interviewer mainly evaluated
+    (e.g. "Live project demonstration", "Backend/API depth", "Ownership of work",
+    "React fundamentals").
+
+Base everything ONLY on the transcript. Do not invent. Be concise and concrete.
+"""
+
+COMPANY_BASE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["expectations", "focus"],
+    "properties": {
+        "expectations": {"type": "string"},
+        "focus": {"type": "array", "items": {"type": "string"}},
+    },
+}
+COMPANY_GEMINI_SCHEMA = _strip_for_gemini(copy.deepcopy(COMPANY_BASE_SCHEMA))
+COMPANY_OPENAI_SCHEMA = {"name": "company_summary", "strict": True, "schema": COMPANY_BASE_SCHEMA}
+
+
 def build_user_prompt(*, transcript_text: str, student_label: str, context: dict[str, Any]) -> str:
     return (
         f"Company: {context.get('company') or 'Unknown'}\n"
@@ -269,7 +307,7 @@ def _coerce(parsed: Any) -> dict[str, Any]:
     return parsed
 
 
-async def _analyze_openai(system: str, user: str) -> dict[str, Any]:
+async def _analyze_openai(system: str, user: str, *, openai_schema: dict = OPENAI_SCHEMA, coerce: bool = True) -> dict[str, Any]:
     settings = get_settings()
     key = (settings.openai_api_key or "").strip()
     # Tolerate a label accidentally pasted in front of the key in .env.
@@ -287,7 +325,7 @@ async def _analyze_openai(system: str, user: str) -> dict[str, Any]:
         response = await client.chat.completions.create(
             model=settings.openai_model,
             messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            response_format={"type": "json_schema", "json_schema": OPENAI_SCHEMA},
+            response_format={"type": "json_schema", "json_schema": openai_schema},
             temperature=0.2,
         )
     except Exception as exc:
@@ -297,14 +335,16 @@ async def _analyze_openai(system: str, user: str) -> dict[str, Any]:
     if not content:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="OpenAI returned an empty response.")
     try:
-        parsed = _coerce(json.loads(content))
+        parsed = json.loads(content)
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="OpenAI returned invalid JSON.") from exc
+    if coerce:
+        parsed = _coerce(parsed)
     parsed["_model"] = settings.openai_model
     return parsed
 
 
-async def _analyze_gemini(system: str, user: str) -> dict[str, Any]:
+async def _analyze_gemini(system: str, user: str, *, gemini_schema: dict = GEMINI_SCHEMA, coerce: bool = True) -> dict[str, Any]:
     settings = get_settings()
     key = (settings.gemini_api_key or "").strip()
     if not key:
@@ -327,7 +367,7 @@ async def _analyze_gemini(system: str, user: str) -> dict[str, Any]:
             user,
             generation_config={
                 "response_mime_type": "application/json",
-                "response_schema": GEMINI_SCHEMA,
+                "response_schema": gemini_schema,
                 "temperature": 0.2,
             },
         )
@@ -338,9 +378,11 @@ async def _analyze_gemini(system: str, user: str) -> dict[str, Any]:
     if not content:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Gemini returned an empty response.")
     try:
-        parsed = _coerce(json.loads(content))
+        parsed = json.loads(content)
     except json.JSONDecodeError as exc:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Gemini returned invalid JSON.") from exc
+    if coerce:
+        parsed = _coerce(parsed)
     parsed["_model"] = settings.gemini_model
     return parsed
 
@@ -373,3 +415,25 @@ async def analyze_candidate_block(
     result["_truncated"] = len(transcript_text) > settings.ai_max_transcript_chars
     result["_provider"] = provider
     return result
+
+
+async def analyze_company_summary(*, transcript_text: str, context: dict[str, Any]) -> dict[str, Any]:
+    """One company-level pass over the whole session: what the company was looking
+    for + the interviewer's focus areas. Reuses the same provider dispatch."""
+    settings = get_settings()
+    truncated = transcript_text[: settings.ai_max_transcript_chars]
+    user = (
+        f"Company: {context.get('company') or 'Unknown'}\n"
+        f"Role: {context.get('role') or 'Unknown'}\n"
+        f"Interview round: {context.get('round_name') or 'Unknown'}\n\n"
+        f"TRANSCRIPT (whole session, all candidates):\n{truncated}"
+    )
+    provider = (settings.ai_provider or "gemini").strip().lower()
+    if provider == "gemini":
+        return await _analyze_gemini(COMPANY_SYSTEM_PROMPT, user, gemini_schema=COMPANY_GEMINI_SCHEMA, coerce=False)
+    if provider == "openai":
+        return await _analyze_openai(COMPANY_SYSTEM_PROMPT, user, openai_schema=COMPANY_OPENAI_SCHEMA, coerce=False)
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail=f"AI provider '{provider}' is not supported. Use 'gemini' or 'openai'.",
+    )

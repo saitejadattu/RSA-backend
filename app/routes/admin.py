@@ -13,6 +13,7 @@ from app.services.admin_dashboard_service import (
     get_admin_student_detail,
     list_admin_reports,
     list_admin_students,
+    list_pending_sessions,
     list_recent_applications,
 )
 from app.services.interview_report_service import list_questions, question_bank, set_report_visibility
@@ -98,6 +99,13 @@ async def bank(
     """Deduplicated question bank: one row per distinct question with how often
     it was asked and which companies asked it."""
     return await question_bank(technical_only=technical_only, limit=limit)
+
+
+@router.get("/sessions/pending")
+async def pending_sessions() -> list[dict]:
+    """Sessions with a transcript but no full RSA yet — drives the
+    'Generate reports' button (analysed one at a time by the client)."""
+    return await list_pending_sessions()
 
 
 @router.get("/reports")

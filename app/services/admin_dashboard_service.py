@@ -4,7 +4,15 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
 
-from app.db.collections import APPLICATIONS, COMPANIES, HIRING_OPPORTUNITIES, INTERVIEW_REPORTS, STUDENTS
+from app.db.collections import (
+    APPLICATIONS,
+    COMPANIES,
+    HIRING_OPPORTUNITIES,
+    INTERVIEW_REPORTS,
+    INTERVIEW_SESSIONS,
+    STUDENTS,
+    TRANSCRIPTS,
+)
 from app.db.mongodb import get_database
 from app.models.application import normalize_application_status
 from app.utils.mongo import serialize_mongo
@@ -827,6 +835,34 @@ async def get_admin_student_detail(student_id: str) -> dict:
     )
 
 
+async def list_pending_sessions() -> list[dict]:
+    """Sessions that have a transcript with mapped students but no full RSA yet
+    (company_expectations not generated). These are what the 'Generate reports'
+    button runs, one at a time, so the per-day AI quota isn't blown in a burst."""
+    db = get_database()
+    sessions = await db[INTERVIEW_SESSIONS].find(
+        {"company_expectations.expectations": None}
+    ).to_list(length=None)
+    out: list[dict] = []
+    for se in sessions:
+        transcript = await db[TRANSCRIPTS].find_one({"session_id": se["_id"]}, {"speaker_map": 1})
+        mapped = [
+            m for m in ((transcript or {}).get("speaker_map") or [])
+            if m.get("role") == "student" and m.get("student_id")
+        ]
+        if not transcript or not mapped:
+            continue  # can't analyse without a transcript + mapped students
+        co = await db[COMPANIES].find_one({"_id": se.get("company_id")}, {"name": 1})
+        opp = await db[HIRING_OPPORTUNITIES].find_one({"_id": se.get("opportunity_id")}, {"role": 1})
+        out.append({
+            "id": se["_id"],
+            "company": (co or {}).get("name") or "Company",
+            "role": (opp or {}).get("role"),
+            "students": len(mapped),
+        })
+    return serialize_mongo(out)
+
+
 async def list_admin_reports(*, published: bool | None = None, limit: int = 300) -> list[dict]:
     """All interview reports for the admin reports view: newest first, joined to
     student / company / role, with the full report body (admin sees score too).
@@ -848,13 +884,17 @@ async def list_admin_reports(*, published: bool | None = None, limit: int = 300)
             {"$unwind": {"path": "$co", "preserveNullAndEmptyArrays": True}},
             {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opp"}},
             {"$unwind": {"path": "$opp", "preserveNullAndEmptyArrays": True}},
+            {"$lookup": {"from": INTERVIEW_SESSIONS, "localField": "session_id", "foreignField": "_id", "as": "sess"}},
+            {"$unwind": {"path": "$sess", "preserveNullAndEmptyArrays": True}},
             {
                 "$project": {
                     "overall": 1, "communication": 1, "strengths": 1, "improvements": 1,
                     "skill_ratings": 1, "interviewer_feedback": 1, "answers": 1,
+                    "interviewer_satisfaction": 1, "coaching_note": 1,
                     "visible_to_student": 1, "generated_at": 1, "application_id": 1,
                     "company": "$co.name", "role": "$opp.role",
                     "student": {"id": "$st._id", "name": "$st.name"},
+                    "company_expectations": "$sess.company_expectations",
                 }
             },
         ]

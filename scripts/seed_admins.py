@@ -31,7 +31,8 @@ from app.utils.password import hash_password  # noqa: E402
 # EDIT THIS FIXED LIST — one entry per admin.
 # ---------------------------------------------------------------------------
 ADMINS = [
-    {"name": "Admin One", "email": "admin1@example.com"},
+    {"name": "Admin One", "email": "admin@example.com"},
+    
     # add one entry per admin, then run this script
 ]
 
