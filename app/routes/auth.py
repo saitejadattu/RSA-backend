@@ -26,7 +26,9 @@ async def check_student(payload: StudentCheckRequest) -> dict:
 
 @router.post("/login", response_model=LoginResponse)
 async def login(payload: LoginRequest) -> dict:
-    return await auth_service.login(payload.identifier, payload.password)
+    # Unified sign-in: email -> admin, mobile number -> student. The response
+    # `role` tells the client where to route.
+    return await auth_service.unified_login(payload.identifier, payload.password)
 
 
 @router.post("/admin-login", response_model=AdminLoginResponse)

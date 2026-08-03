@@ -108,14 +108,25 @@ async def login(identifier: str, password: str) -> dict:
         return {
             "status": AUTH_STATUS_PASSWORD_RESET_REQUIRED,
             "reset_token": _reset_token(student),
+            "role": ROLE_STUDENT,
             "message": "Password reset required",
         }
 
     return {
         "status": AUTH_STATUS_AUTHENTICATED,
         "access_token": _access_token(student),
+        "role": ROLE_STUDENT,
         "message": "Login successful",
     }
+
+
+async def unified_login(identifier: str, password: str) -> dict:
+    """Single sign-in entry point. An email routes to an admin account; anything
+    else (a mobile number) to a student. The response's `role` tells the client
+    where to send the user. Error messages stay generic so nothing leaks."""
+    if "@" in (identifier or ""):
+        return await admin_login(identifier, password)
+    return await login(identifier, password)
 
 
 async def admin_login(email: str, password: str) -> dict:
@@ -126,6 +137,7 @@ async def admin_login(email: str, password: str) -> dict:
         return {
             "status": AUTH_STATUS_AUTHENTICATED,
             "access_token": _admin_access_token(),
+            "role": ROLE_ADMIN,
             "message": "Admin login successful",
         }
 
@@ -133,19 +145,21 @@ async def admin_login(email: str, password: str) -> dict:
     db = get_database()
     admin = await db[ADMINS].find_one({"email": email_norm})
     if admin is None or not admin.get("password_hash") or not verify_password(password, admin["password_hash"]):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid admin credentials")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
     # First login (or a re-issued temp password): force them to set their own.
     if admin.get("force_password_reset") or not admin.get("is_password_set"):
         return {
             "status": AUTH_STATUS_PASSWORD_RESET_REQUIRED,
             "reset_token": _admin_reset_token(admin),
+            "role": ROLE_ADMIN,
             "message": "Set your own password to continue",
         }
 
     return {
         "status": AUTH_STATUS_AUTHENTICATED,
         "access_token": _admin_token_for(admin),
+        "role": ROLE_ADMIN,
         "message": "Admin login successful",
     }
 
