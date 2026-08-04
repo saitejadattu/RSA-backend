@@ -58,6 +58,17 @@ class SheetUrlRequest(BaseModel):
     confirm: bool = Field(default=False, description="False previews without writing; true performs the import.")
 
 
+class SheetLinksUpdate(BaseModel):
+    """Set / correct the response and/or shortlist sheet URL on one opening.
+
+    Omit a field to leave it untouched; send "" to clear it. Saving stamps the
+    link as changed so the next Sync pulls the corrected sheet.
+    """
+
+    student_response_sheet: str | None = Field(default=None, description="Google Sheets URL for the response sheet.")
+    company_sheet: str | None = Field(default=None, description="Google Sheets URL for the shortlist / company sheet.")
+
+
 class TranscriptConfirmRequest(BaseModel):
     """The admin-reviewed proposal. Nothing is written until this is posted."""
 

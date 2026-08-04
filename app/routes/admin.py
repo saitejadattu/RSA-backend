@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, Query
 
 from app.schemas.interview_report import (
     ReportVisibilityUpdate,
+    SheetLinksUpdate,
     SheetPasteRequest,
     SheetSyncRequest,
     SheetUrlRequest,
@@ -23,6 +24,7 @@ from app.services.sheet_import_service import (
     import_responses,
     import_shortlist,
     sync_from_sheet,
+    update_sheet_links,
 )
 from app.utils.dependencies import require_admin_access
 
@@ -155,6 +157,17 @@ async def import_shortlist_sheet(opportunity_id: str, payload: SheetPasteRequest
     """Paste a shortlist sheet for this opening. confirm=false previews only."""
     return await import_shortlist(
         opportunity_id=opportunity_id, raw_text=payload.raw_text, confirm=payload.confirm
+    )
+
+
+@router.patch("/opportunities/{opportunity_id}/sheet-links")
+async def update_opportunity_sheet_links(opportunity_id: str, payload: SheetLinksUpdate) -> dict:
+    """Set / correct this opening's response and/or shortlist sheet URL directly,
+    without re-importing the master sheet. Then Sync to pull the corrected data."""
+    return await update_sheet_links(
+        opportunity_id=opportunity_id,
+        response_url=payload.student_response_sheet,
+        company_url=payload.company_sheet,
     )
 
 

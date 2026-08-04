@@ -173,9 +173,13 @@ FIELD_DETECT: dict[str, dict[str, tuple[str, ...]]] = {
         "fuzzy": (),
     },
     "name": {
-        "aliases": ("student_name", "full_name", "candidate_name", "name", "student_full_name"),
-        "keywords": ("full_name", "student_name", "candidate_name"),
-        "exclude": (),
+        # Full-name variants first so a "Full Name" column wins over a bare "Name".
+        "aliases": ("full_name", "student_full_name", "candidate_full_name", "student_name",
+                    "candidate_name", "applicant_name", "name"),
+        "keywords": ("full_name", "student_name", "candidate_name", "applicant_name", "name"),
+        # Don't grab company / college / job / file etc. name columns.
+        "exclude": ("company", "college", "job", "role", "product", "file", "sheet",
+                    "opportunity", "parent", "father", "mother", "guardian"),
         "fuzzy": (),
     },
     "email": {
@@ -408,7 +412,13 @@ def read_shortlist_rows(raw_text: str) -> list[list[str | None]]:
         if not any(cleaned):
             continue
         first = (cleaned[0] or "").strip().lower()
-        if first in {"uid", "full name", "name"}:  # header, may repeat
+        # Header rows (they can repeat mid-sheet). Accept the many ways the name /
+        # index column gets labelled so a "Student Name" header isn't read as data.
+        if first in {
+            "uid", "full name", "name", "student name", "student full name",
+            "candidate name", "applicant name", "s.no", "sno", "s no", "sl.no",
+            "sl no", "serial", "serial no", "#",
+        }:
             continue
         rows.append(cleaned)
     return rows
@@ -684,6 +694,55 @@ async def sync_from_sheet(
         result = await import_shortlist(opportunity_id=opportunity_id, raw_text=raw_text, confirm=confirm)
     result["source_url"] = url
     return result
+
+
+async def update_sheet_links(
+    *, opportunity_id: str, response_url: str | None = None, company_url: str | None = None
+) -> dict:
+    """Set / correct the response and/or shortlist sheet URL on one opening,
+    without re-importing the whole master sheet.
+
+    Each provided URL is validated as a Google Sheets link, stored, and stamped
+    as 'changed now' so the next Sync pulls it (instead of skipping an already
+    imported opening). Pass an empty string to clear a link.
+    """
+    db = get_database()
+    opportunity, _ = await load_opportunity(db, opportunity_id)
+    now = datetime.now(timezone.utc)
+
+    set_fields: dict[str, Any] = {}
+    for value, field, changed_at, previous in (
+        (response_url, "student_response_sheet", "response_sheet_changed_at", "previous_student_response_sheet"),
+        (company_url, "company_sheet", "company_sheet_changed_at", "previous_company_sheet"),
+    ):
+        if value is None:  # field not part of this update
+            continue
+        new_url = value.strip()
+        if new_url and not sheet_export_url(new_url):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="That doesn't look like a Google Sheets link. Paste the full sheet URL.",
+            )
+        old_url = (opportunity.get(field) or "").strip()
+        if new_url == old_url:
+            continue
+        set_fields[field] = new_url or None
+        set_fields[changed_at] = now
+        if old_url:
+            set_fields[previous] = old_url
+
+    if not set_fields:
+        return serialize_mongo({"mode": "unchanged", "opportunity_id": opportunity_id})
+
+    set_fields["updated_at"] = now
+    await db[HIRING_OPPORTUNITIES].update_one({"_id": opportunity["_id"]}, {"$set": set_fields})
+    updated = await db[HIRING_OPPORTUNITIES].find_one(
+        {"_id": opportunity["_id"]},
+        {"student_response_sheet": 1, "company_sheet": 1,
+         "response_sheet_changed_at": 1, "company_sheet_changed_at": 1,
+         "responses_imported_at": 1, "shortlist_imported_at": 1},
+    )
+    return serialize_mongo({"mode": "updated", **(updated or {})})
 
 
 async def load_opportunity(db, opportunity_id: str) -> tuple[dict, dict]:
