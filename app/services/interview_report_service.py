@@ -142,7 +142,11 @@ async def _match_opportunity(db, company: dict, meeting_date) -> tuple[dict | No
 
 async def _shortlisted_students(db, opportunity: dict) -> list[dict[str, Any]]:
     """The candidates we expect in the room: applications shortlisted (or beyond)
-    for this opening."""
+    for this opening.
+
+    Includes the post-interview statuses (INTERVIEW_COMPLETED / NOT_ATTENDED) so a
+    transcript can be **re-extracted**: the first run moves everyone off SHORTLISTED,
+    and without these the second run would find no candidates to map."""
     applications = await db[APPLICATIONS].find(
         {
             "opportunity_id": opportunity["_id"],
@@ -151,6 +155,8 @@ async def _shortlisted_students(db, opportunity: dict) -> list[dict[str, Any]]:
                     "SHORTLISTED",
                     "INTERVIEW_SCHEDULED",
                     "INTERVIEW_IN_PROGRESS",
+                    "INTERVIEW_COMPLETED",
+                    "INTERVIEW_NOT_ATTENDED",
                     "SELECTED",
                     "OFFER_PENDING",
                     "OFFER_RELEASED",
