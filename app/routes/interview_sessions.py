@@ -16,6 +16,7 @@ from app.schemas.interview_session import (
 from app.services.interview_report_service import (
     analyze_session,
     confirm_transcript,
+    delete_session,
     get_transcript,
     list_session_reports,
     propose_from_transcript,
@@ -69,6 +70,13 @@ async def get_session(session_id: str) -> dict:
 @router.patch("/{session_id}")
 async def update_session(session_id: str, payload: InterviewSessionUpdate) -> dict:
     return await update_interview_session(session_id, payload)
+
+
+@router.delete("/{session_id}", dependencies=[Depends(require_admin_access)])
+async def remove_session(session_id: str) -> dict:
+    """Delete a session and its derived data (transcript, questions, reports).
+    For removing a duplicate or half-finished extraction."""
+    return await delete_session(session_id)
 
 
 @router.patch("/{session_id}/students/{student_id}")

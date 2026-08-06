@@ -1,4 +1,5 @@
 import difflib
+import hashlib
 import re
 from typing import Any
 
@@ -40,6 +41,14 @@ from app.services.transcript_service import (
 )
 from app.utils.mongo import serialize_mongo
 from app.utils.object_id import to_object_id
+
+
+def _transcript_hash(raw_text: str) -> str:
+    """Stable fingerprint of a transcript's content, so the same paste (ignoring
+    whitespace/case differences) is recognised as a re-extraction of one session
+    rather than creating a duplicate."""
+    normalized = re.sub(r"\s+", " ", (raw_text or "")).strip().lower()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def object_id_or_422(value: str, label: str):
@@ -234,8 +243,29 @@ async def propose_from_transcript(raw_text: str, opportunity_id: str | None = No
     blocks = candidate_blocks(segments, sorted(student_speakers), interviewer)
     matched_student_ids = {str(item["student_id"]) for item in speaker_map if item.get("student_id")}
 
+    # Already extracted this exact transcript for this opening? Tell the caller so
+    # it can offer "open the existing report" instead of re-hitting the AI.
+    existing_session = None
+    if opportunity:
+        prior = await db[TRANSCRIPTS].find_one(
+            {"opportunity_id": opportunity["_id"], "transcript_hash": _transcript_hash(raw_text)},
+            {"session_id": 1},
+        )
+        if prior:
+            session = await db[INTERVIEW_SESSIONS].find_one(
+                {"_id": prior["session_id"]}, {"round_name": 1, "ai_status": 1, "scheduled_at": 1}
+            )
+            if session:
+                existing_session = {
+                    "session_id": session["_id"],
+                    "round_name": session.get("round_name"),
+                    "ai_status": session.get("ai_status"),
+                    "scheduled_at": session.get("scheduled_at"),
+                }
+
     return serialize_mongo(
         {
+            "existing_session": existing_session,
             "header": {
                 "title": header.get("title"),
                 "meeting_date": header.get("meeting_date"),
@@ -382,32 +412,42 @@ async def confirm_transcript(
     student_speakers = [item["speaker_label"] for item in resolved_map if item["role"] == "student"]
     blocks = candidate_blocks(segments, student_speakers, interviewer)
     label_to_student = {item["speaker_label"]: item["student_id"] for item in resolved_map if item["student_id"]}
+    thash = _transcript_hash(raw_text)
 
-    session_document = {
+    # Same transcript already extracted for this opening? Reuse that session so a
+    # re-run OVERWRITES it instead of creating a duplicate session (which would
+    # double the questions and per-student reports).
+    existing = await db[TRANSCRIPTS].find_one(
+        {"opportunity_id": opportunity_object_id, "transcript_hash": thash},
+        {"session_id": 1},
+    )
+
+    blocks_payload = [
+        {
+            "speaker_label": block["speaker_label"],
+            "student_id": label_to_student.get(block["speaker_label"]),
+            "start_order": block["start_order"],
+            "end_order": block["end_order"],
+            "segment_count": block["segment_count"],
+        }
+        for block in blocks
+    ]
+
+    session_fields = {
         "company_id": company_object_id,
         "opportunity_id": opportunity_object_id,
         "round_name": round_name,
         "round_type": round_type,
         "students": session_students,
-        "interview_link": None,
-        "transcript_drive_link": None,
         "scheduled_at": header.get("meeting_date"),
         "started_at": header.get("meeting_date"),
-        "ended_at": None,
         "status": "completed",
-        "processed": False,
         "transcript_status": "uploaded",
-        "ai_status": "not_started",
         "source": "transcript_import",
-        "created_by": None,
-        "created_at": now,
+        "transcript_hash": thash,
         "updated_at": now,
     }
-    session_result = await db[INTERVIEW_SESSIONS].insert_one(session_document)
-    session_object_id = session_result.inserted_id
-
-    transcript_document = {
-        "session_id": session_object_id,
+    transcript_fields = {
         "company_id": company_object_id,
         "opportunity_id": opportunity_object_id,
         "source": source,
@@ -419,29 +459,47 @@ async def confirm_transcript(
         "segments": segments,
         "speaker_map": resolved_map,
         "interviewer": interviewer,
-        "blocks": [
-            {
-                "speaker_label": block["speaker_label"],
-                "student_id": label_to_student.get(block["speaker_label"]),
-                "start_order": block["start_order"],
-                "end_order": block["end_order"],
-                "segment_count": block["segment_count"],
-            }
-            for block in blocks
-        ],
-        "created_at": now,
+        "blocks": blocks_payload,
+        "transcript_hash": thash,
         "updated_at": now,
     }
-    await db[TRANSCRIPTS].insert_one(transcript_document)
+
+    reused = bool(existing)
+    if reused:
+        session_object_id = existing["session_id"]
+        await db[INTERVIEW_SESSIONS].update_one({"_id": session_object_id}, {"$set": session_fields})
+        await db[TRANSCRIPTS].update_one(
+            {"session_id": session_object_id},
+            {"$set": {**transcript_fields, "session_id": session_object_id}, "$setOnInsert": {"created_at": now}},
+            upsert=True,
+        )
+    else:
+        session_result = await db[INTERVIEW_SESSIONS].insert_one(
+            {
+                **session_fields,
+                "interview_link": None,
+                "transcript_drive_link": None,
+                "ended_at": None,
+                "processed": False,
+                "ai_status": "not_started",
+                "created_by": None,
+                "created_at": now,
+            }
+        )
+        session_object_id = session_result.inserted_id
+        await db[TRANSCRIPTS].insert_one(
+            {**transcript_fields, "session_id": session_object_id, "created_at": now}
+        )
 
     return serialize_mongo(
         {
             "session_id": session_object_id,
+            "reused": reused,
             "company": {"id": company_object_id, "name": company.get("name")},
             "opportunity": {"id": opportunity_object_id, "role": opportunity.get("role")},
             "interviewer": interviewer,
             "students_confirmed": len(session_students),
-            "blocks": transcript_document["blocks"],
+            "blocks": blocks_payload,
             "segment_count": len(segments),
         }
     )
@@ -928,6 +986,35 @@ async def analyze_session(session_id: str) -> dict:
         "model": model_used,
         "failures": failures,
         **advanced,
+    }
+
+
+async def delete_session(session_id: str) -> dict:
+    """Delete an interview session and everything derived from it: its transcript,
+    extracted questions and per-student reports. Used to remove a duplicate or
+    abandoned (half-finished) extraction.
+
+    Application statuses are intentionally left untouched — they are opportunity-
+    level and may still be backed by another session or the shortlist. Use
+    scripts/reset_extraction.py when a full status revert is also wanted.
+    """
+    db = get_database()
+    session_object_id = object_id_or_422(session_id, "session id")
+    session = await db[INTERVIEW_SESSIONS].find_one({"_id": session_object_id}, {"_id": 1})
+    if not session:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Interview session not found")
+
+    reports = await db[INTERVIEW_REPORTS].delete_many({"session_id": session_object_id})
+    questions = await db[QUESTIONS].delete_many({"session_id": session_object_id})
+    transcripts = await db[TRANSCRIPTS].delete_many({"session_id": session_object_id})
+    await db[INTERVIEW_SESSIONS].delete_one({"_id": session_object_id})
+
+    return {
+        "deleted": True,
+        "session_id": session_id,
+        "reports_deleted": reports.deleted_count,
+        "questions_deleted": questions.deleted_count,
+        "transcripts_deleted": transcripts.deleted_count,
     }
 
 

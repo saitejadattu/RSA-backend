@@ -574,7 +574,10 @@ async def get_admin_analytics(start: str | None = None, end: str | None = None) 
     apps_by_student: dict = {}
     not_shortlisted_by_student: dict = {}
     if active_oids:
-        students_docs = await db[STUDENTS].find({"_id": {"$in": active_oids}}, {"name": 1}).to_list(length=None)
+        students_docs = await db[STUDENTS].find(
+            {"_id": {"$in": active_oids}},
+            {"name": 1, "email": 1, "phone": 1, "external_user_id": 1},
+        ).to_list(length=None)
         id_to_name = {s["_id"]: s for s in students_docs}
         app_rows = await db[APPLICATIONS].aggregate(
             [
@@ -620,6 +623,9 @@ async def get_admin_analytics(start: str | None = None, end: str | None = None) 
         {
             "id": e["_id"],
             "name": (id_to_name.get(e["_id"], {}) or {}).get("name") or "Unknown",
+            "external_user_id": (id_to_name.get(e["_id"], {}) or {}).get("external_user_id"),
+            "email": (id_to_name.get(e["_id"], {}) or {}).get("email"),
+            "phone": (id_to_name.get(e["_id"], {}) or {}).get("phone"),
             "apps": e["apps"],
             "shortlisted": e["shortlisted"],
             "not_shortlisted": not_shortlisted_by_student.get(e["_id"], 0),
@@ -718,37 +724,62 @@ async def get_admin_student_detail(student_id: str) -> dict:
     except ValueError:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid student id")
 
-    student = await db[STUDENTS].find_one({"_id": oid})
+    app_pipeline = [
+        {"$match": {"student_id": oid}},
+        {"$sort": {"applied_at": -1, "created_at": -1}},
+        {"$lookup": {"from": COMPANIES, "localField": "company_id", "foreignField": "_id", "as": "co"}},
+        {"$unwind": {"path": "$co", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opp"}},
+        {"$unwind": {"path": "$opp", "preserveNullAndEmptyArrays": True}},
+        {
+            "$project": {
+                "status": _STATUS,
+                "interested": _INTERESTED,
+                "applied_at": 1,
+                "resume_link": {"$ifNull": ["$application_details.submitted_resume_url", "$resume_link"]},
+                "github_link": {"$ifNull": ["$application_details.github_link", "$github_link"]},
+                "project_link": {"$ifNull": ["$application_details.project_link", "$project_link"]},
+                "interest_reason": "$application_details.interest_reason",
+                "non_interest_reason": "$application_details.non_interest_reason",
+                "company": "$co.name",
+                "company_id": "$co._id",
+                "role": "$opp.role",
+                "skills": "$opp.must_have_skills",
+                "opportunity_id": "$opp._id",
+            }
+        },
+    ]
+    reports_pipeline = [
+        {"$match": {"student_id": oid}},
+        {"$sort": {"generated_at": -1, "created_at": -1}},
+        {"$lookup": {"from": COMPANIES, "localField": "company_id", "foreignField": "_id", "as": "co"}},
+        {"$unwind": {"path": "$co", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opp"}},
+        {"$unwind": {"path": "$opp", "preserveNullAndEmptyArrays": True}},
+        {
+            "$project": {
+                "overall": 1,
+                "communication": 1,
+                "strengths": 1,
+                "improvements": 1,
+                "skill_ratings": 1,
+                "interviewer_feedback": 1,
+                "visible_to_student": 1,
+                "generated_at": 1,
+                "company": "$co.name",
+                "role": "$opp.role",
+            }
+        },
+    ]
+    # All three are keyed only by the student id and independent of each other —
+    # run them as one parallel batch instead of three serial round trips.
+    student, app_rows, reports = await asyncio.gather(
+        db[STUDENTS].find_one({"_id": oid}),
+        db[APPLICATIONS].aggregate(app_pipeline).to_list(length=None),
+        db[INTERVIEW_REPORTS].aggregate(reports_pipeline).to_list(length=None),
+    )
     if not student:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
-
-    app_rows = await db[APPLICATIONS].aggregate(
-        [
-            {"$match": {"student_id": oid}},
-            {"$sort": {"applied_at": -1, "created_at": -1}},
-            {"$lookup": {"from": COMPANIES, "localField": "company_id", "foreignField": "_id", "as": "co"}},
-            {"$unwind": {"path": "$co", "preserveNullAndEmptyArrays": True}},
-            {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opp"}},
-            {"$unwind": {"path": "$opp", "preserveNullAndEmptyArrays": True}},
-            {
-                "$project": {
-                    "status": _STATUS,
-                    "interested": _INTERESTED,
-                    "applied_at": 1,
-                    "resume_link": {"$ifNull": ["$application_details.submitted_resume_url", "$resume_link"]},
-                    "github_link": {"$ifNull": ["$application_details.github_link", "$github_link"]},
-                    "project_link": {"$ifNull": ["$application_details.project_link", "$project_link"]},
-                    "interest_reason": "$application_details.interest_reason",
-                    "non_interest_reason": "$application_details.non_interest_reason",
-                    "company": "$co.name",
-                    "company_id": "$co._id",
-                    "role": "$opp.role",
-                    "skills": "$opp.must_have_skills",
-                    "opportunity_id": "$opp._id",
-                }
-            },
-        ]
-    ).to_list(length=None)
 
     stats = {"responses": 0, "interested": 0, "shortlisted": 0, "selected": 0, "declined": 0}
     role_counts: dict = {}
@@ -784,31 +815,6 @@ async def get_admin_student_detail(student_id: str) -> dict:
         )
     role_breakdown = sorted([{"category": k, "n": v} for k, v in role_counts.items()], key=lambda x: -x["n"])
 
-    reports = await db[INTERVIEW_REPORTS].aggregate(
-        [
-            {"$match": {"student_id": oid}},
-            {"$sort": {"generated_at": -1, "created_at": -1}},
-            {"$lookup": {"from": COMPANIES, "localField": "company_id", "foreignField": "_id", "as": "co"}},
-            {"$unwind": {"path": "$co", "preserveNullAndEmptyArrays": True}},
-            {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opp"}},
-            {"$unwind": {"path": "$opp", "preserveNullAndEmptyArrays": True}},
-            {
-                "$project": {
-                    "overall": 1,
-                    "communication": 1,
-                    "strengths": 1,
-                    "improvements": 1,
-                    "skill_ratings": 1,
-                    "interviewer_feedback": 1,
-                    "visible_to_student": 1,
-                    "generated_at": 1,
-                    "company": "$co.name",
-                    "role": "$opp.role",
-                }
-            },
-        ]
-    ).to_list(length=None)
-
     return serialize_mongo(
         {
             "student": {
@@ -843,21 +849,37 @@ async def list_pending_sessions() -> list[dict]:
     sessions = await db[INTERVIEW_SESSIONS].find(
         {"company_expectations.expectations": None}
     ).to_list(length=None)
+    if not sessions:
+        return []
+
+    # Batch the lookups instead of 3 queries per session (was N+1, slow on a
+    # remote Atlas): one query each for transcripts, companies and opportunities.
+    session_ids = [se["_id"] for se in sessions]
+    company_ids = list({se.get("company_id") for se in sessions if se.get("company_id")})
+    opp_ids = list({se.get("opportunity_id") for se in sessions if se.get("opportunity_id")})
+
+    transcripts, companies, opps = await asyncio.gather(
+        db[TRANSCRIPTS].find({"session_id": {"$in": session_ids}}, {"session_id": 1, "speaker_map": 1}).to_list(length=None),
+        db[COMPANIES].find({"_id": {"$in": company_ids}}, {"name": 1}).to_list(length=None),
+        db[HIRING_OPPORTUNITIES].find({"_id": {"$in": opp_ids}}, {"role": 1}).to_list(length=None),
+    )
+    tx_by_session = {t["session_id"]: t for t in transcripts}
+    co_by_id = {c["_id"]: c for c in companies}
+    opp_by_id = {o["_id"]: o for o in opps}
+
     out: list[dict] = []
     for se in sessions:
-        transcript = await db[TRANSCRIPTS].find_one({"session_id": se["_id"]}, {"speaker_map": 1})
+        transcript = tx_by_session.get(se["_id"])
         mapped = [
             m for m in ((transcript or {}).get("speaker_map") or [])
             if m.get("role") == "student" and m.get("student_id")
         ]
         if not transcript or not mapped:
             continue  # can't analyse without a transcript + mapped students
-        co = await db[COMPANIES].find_one({"_id": se.get("company_id")}, {"name": 1})
-        opp = await db[HIRING_OPPORTUNITIES].find_one({"_id": se.get("opportunity_id")}, {"role": 1})
         out.append({
             "id": se["_id"],
-            "company": (co or {}).get("name") or "Company",
-            "role": (opp or {}).get("role"),
+            "company": (co_by_id.get(se.get("company_id")) or {}).get("name") or "Company",
+            "role": (opp_by_id.get(se.get("opportunity_id")) or {}).get("role"),
             "students": len(mapped),
         })
     return serialize_mongo(out)

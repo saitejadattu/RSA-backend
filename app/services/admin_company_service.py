@@ -5,6 +5,7 @@ from app.db.mongodb import get_database
 from app.models.application import is_real_application, status_for_api
 from app.utils.mongo import serialize_mongo
 from app.utils.object_id import to_object_id
+import asyncio
 
 
 def _object_id(value: str, label: str):
@@ -48,17 +49,15 @@ async def get_admin_company_detail(company_id: str) -> dict:
     db = get_database()
     object_id = _object_id(company_id, "company id")
 
-    company = await db[COMPANIES].find_one({"_id": object_id})
+    # These three are independent — run them together rather than back-to-back
+    # round trips to a remote Atlas.
+    company, opportunities, applications = await asyncio.gather(
+        db[COMPANIES].find_one({"_id": object_id}),
+        db[HIRING_OPPORTUNITIES].find({"company_id": object_id}).sort("opportunity_received_at", -1).to_list(length=None),
+        db[APPLICATIONS].find({"company_id": object_id}).to_list(length=None),
+    )
     if not company:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Company not found")
-
-    opportunities = (
-        await db[HIRING_OPPORTUNITIES]
-        .find({"company_id": object_id})
-        .sort("opportunity_received_at", -1)
-        .to_list(length=None)
-    )
-    applications = await db[APPLICATIONS].find({"company_id": object_id}).to_list(length=None)
 
     company_counts = _blank_counts()
     counts_by_opportunity: dict = {}
@@ -101,14 +100,6 @@ async def get_admin_opportunity_detail(opportunity_id: str) -> dict:
     db = get_database()
     object_id = _object_id(opportunity_id, "opportunity id")
 
-    opportunity = await db[HIRING_OPPORTUNITIES].find_one({"_id": object_id})
-    if not opportunity:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Hiring opportunity not found"
-        )
-
-    company = await db[COMPANIES].find_one({"_id": opportunity.get("company_id")})
-
     pipeline = [
         {"$match": {"opportunity_id": object_id}},
         {"$sort": {"applied_at": -1, "created_at": -1}},
@@ -140,7 +131,17 @@ async def get_admin_opportunity_detail(opportunity_id: str) -> dict:
             }
         },
     ]
-    applicants = await db[APPLICATIONS].aggregate(pipeline).to_list(length=None)
+    # Opportunity + its applicants are both keyed by the opportunity id — fetch
+    # together; the company then needs the opportunity's company_id.
+    opportunity, applicants = await asyncio.gather(
+        db[HIRING_OPPORTUNITIES].find_one({"_id": object_id}),
+        db[APPLICATIONS].aggregate(pipeline).to_list(length=None),
+    )
+    if not opportunity:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Hiring opportunity not found"
+        )
+    company = await db[COMPANIES].find_one({"_id": opportunity.get("company_id")})
 
     counts = _blank_counts()
     for application in applicants:
