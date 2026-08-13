@@ -1,7 +1,11 @@
 from fastapi import APIRouter, Depends, Query
+from fastapi.responses import StreamingResponse
+from io import BytesIO
 
 from app.schemas.interview_report import (
     ReportVisibilityUpdate,
+    CompanyFeedbackExportRequest,
+    StudentFeedbackExportRequest,
     SheetLinksUpdate,
     SheetPasteRequest,
     SheetSyncRequest,
@@ -13,6 +17,9 @@ from app.services.admin_dashboard_service import (
     get_admin_analytics,
     get_admin_dashboard,
     get_admin_student_detail,
+    build_company_feedback_docx,
+    build_company_feedback_export,
+    build_student_feedback_export,
     list_admin_reports,
     list_admin_students,
     list_pending_sessions,
@@ -123,6 +130,37 @@ async def reports_list(published: bool | None = None) -> list[dict]:
     """All interview reports (newest first) with student/company/role and the full
     report body. published=true -> shared only, published=false -> pending only."""
     return await list_admin_reports(published=published)
+
+
+@router.get("/reports/company/{company_id}/download")
+async def download_company_feedback(company_id: str, month: str | None = Query(default=None, pattern=r"^\d{4}-(0[1-9]|1[0-2])$")) -> StreamingResponse:
+    """Download existing company feedback, optionally limited to one report month."""
+    content, filename = await build_company_feedback_docx(company_id, month=month)
+    return StreamingResponse(
+        BytesIO(content),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/reports/student-feedback/export")
+async def export_student_feedback(payload: StudentFeedbackExportRequest) -> StreamingResponse:
+    """Export selected existing student reports as a combined DOCX and/or ZIP."""
+    content, filename, media_type = await build_student_feedback_export(payload.report_ids, payload.mode)
+    return StreamingResponse(
+        BytesIO(content), media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post("/reports/company-feedback/export")
+async def export_company_feedback(payload: CompanyFeedbackExportRequest) -> StreamingResponse:
+    """Export company feedback for the reports matched by the active UI filters."""
+    content, filename, media_type = await build_company_feedback_export(payload.report_ids, payload.mode)
+    return StreamingResponse(
+        BytesIO(content), media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.patch("/reports/{report_id}/visibility")

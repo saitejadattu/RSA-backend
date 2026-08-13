@@ -1,8 +1,13 @@
 import asyncio
 import re
+import zipfile
+from io import BytesIO
 from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
+from docx import Document
+from docx.enum.text import WD_BREAK
+from docx.shared import Inches, Pt
 
 from app.db.collections import (
     APPLICATIONS,
@@ -935,7 +940,7 @@ async def list_admin_reports(*, published: bool | None = None, limit: int = 300)
                     "skill_ratings": 1, "interviewer_feedback": 1, "answers": 1,
                     "interviewer_satisfaction": 1, "coaching_note": 1,
                     "visible_to_student": 1, "generated_at": 1, "created_at": 1, "application_id": 1,
-                    "company": "$co.name", "role": "$opp.role",
+                    "company_id": 1, "company": "$co.name", "role": "$opp.role",
                     "student": {"id": "$st._id", "name": "$st.name"},
                     "company_expectations": "$sess.company_expectations",
                 }
@@ -943,3 +948,398 @@ async def list_admin_reports(*, published: bool | None = None, limit: int = 300)
         ]
     ).to_list(length=None)
     return serialize_mongo(reports)
+
+
+def _docx_text(value: object) -> str:
+    """Render existing report values without inventing or summarising content."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return str(value).strip()
+
+
+def _docx_list(value: object) -> list[object]:
+    if isinstance(value, list):
+        return value
+    return [value] if value else []
+
+
+def _add_docx_label(doc: Document, label: str, value: object) -> None:
+    text = _docx_text(value)
+    if not text:
+        return
+    paragraph = doc.add_paragraph()
+    paragraph.add_run(f"{label}: ").bold = True
+    paragraph.add_run(text)
+
+
+def _add_docx_heading(doc: Document, text: str, level: int = 2) -> None:
+    doc.add_heading(text.upper(), level=level)
+
+
+async def build_company_feedback_docx(company_id: str, month: str | None = None) -> tuple[bytes, str]:
+    """Create a DOCX from the same raw report/session fields shown to admins."""
+    try:
+        company_object_id = to_object_id(company_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid company id")
+
+    db = get_database()
+    company = await db[COMPANIES].find_one({"_id": company_object_id}, {"name": 1})
+    if not company:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Company not found")
+
+    report_match: dict = {"company_id": company_object_id}
+    if month:
+        try:
+            start = datetime.strptime(month, "%Y-%m").replace(tzinfo=timezone.utc)
+        except ValueError:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Month must use YYYY-MM format")
+        end = datetime(start.year + (start.month == 12), (start.month % 12) + 1, 1, tzinfo=timezone.utc)
+        # The list view uses generated_at and falls back to created_at for older
+        # reports; the export follows the exact same rule.
+        report_match["$or"] = [
+            {"generated_at": {"$gte": start, "$lt": end}},
+            {"generated_at": {"$exists": False}, "created_at": {"$gte": start, "$lt": end}},
+        ]
+
+    reports = await db[INTERVIEW_REPORTS].aggregate([
+        {"$match": report_match},
+        # Match the report-list order: newest report first.
+        {"$sort": {"generated_at": -1, "created_at": -1}},
+        {"$lookup": {"from": STUDENTS, "localField": "student_id", "foreignField": "_id", "as": "student"}},
+        {"$unwind": {"path": "$student", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opportunity"}},
+        {"$unwind": {"path": "$opportunity", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": INTERVIEW_SESSIONS, "localField": "session_id", "foreignField": "_id", "as": "session"}},
+        {"$unwind": {"path": "$session", "preserveNullAndEmptyArrays": True}},
+    ]).to_list(length=None)
+
+    if not reports:
+        scope = f" for {month}" if month else ""
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No interview reports found for this company{scope}")
+
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = Inches(0.7)
+    section.bottom_margin = Inches(0.7)
+    normal_style = document.styles["Normal"]
+    normal_style.font.name = "Aptos"
+    normal_style.font.size = Pt(10)
+
+    company_name = company.get("name") or "Company"
+    document.add_heading("Company Interview Feedback", level=0)
+    document.add_heading(company_name, level=1)
+    _add_docx_label(document, "Candidates", len(reports))
+
+    company_summary = next((
+        (report.get("session") or {}).get("company_expectations")
+        for report in reports
+        if (report.get("session") or {}).get("company_expectations")
+    ), {}) or {}
+    if company_summary.get("expectations") or company_summary.get("focus"):
+        _add_docx_heading(document, "What This Company Looked For")
+        if company_summary.get("expectations"):
+            document.add_paragraph(_docx_text(company_summary["expectations"]))
+        focus = [_docx_text(item) for item in _docx_list(company_summary.get("focus")) if _docx_text(item)]
+        if focus:
+            paragraph = document.add_paragraph()
+            paragraph.add_run("Requirements: ").bold = True
+            paragraph.add_run(" • ".join(focus))
+
+    for index, report in enumerate(reports, start=1):
+        if index > 1:
+            document.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+        document.add_heading(f"Candidate {index}", level=1)
+        _add_docx_label(document, "Name", (report.get("student") or {}).get("name") or "Student")
+        _add_docx_label(document, "Company", company_name)
+        _add_docx_label(document, "Role", (report.get("opportunity") or {}).get("role"))
+        score = (report.get("overall") or {}).get("score")
+        if score is not None:
+            _add_docx_label(document, "Score", f"{score}/10")
+        interview_date = (report.get("session") or {}).get("scheduled_at") or report.get("generated_at") or report.get("created_at")
+        if interview_date:
+            date_text = f"{interview_date.month}/{interview_date.day}/{interview_date.year}" if isinstance(interview_date, datetime) else interview_date
+            _add_docx_label(document, "Interview Date", date_text)
+        _add_docx_label(document, "Status", "Published" if report.get("visible_to_student") else "Pending")
+
+        overall = report.get("overall") or {}
+        if overall.get("summary"):
+            _add_docx_heading(document, "Overall Feedback")
+            document.add_paragraph(_docx_text(overall["summary"]))
+        if report.get("interviewer_satisfaction"):
+            _add_docx_heading(document, "How They Met The Bar")
+            document.add_paragraph(_docx_text(report["interviewer_satisfaction"]))
+
+        answers = _docx_list(report.get("answers"))
+        if answers:
+            _add_docx_heading(document, "Questions & Answers")
+            for question_index, answer in enumerate(answers, start=1):
+                if not isinstance(answer, dict):
+                    continue
+                document.add_heading(f"Q{question_index}. {_docx_text(answer.get('question_text'))}", level=3)
+                accuracy = answer.get("accuracy")
+                if accuracy is not None:
+                    _add_docx_label(document, "Score", f"{round(float(accuracy) / 20, 1)}/5")
+                _add_docx_label(document, "Candidate", answer.get("student_answer"))
+                _add_docx_label(document, "Expected", answer.get("ideal_answer"))
+                _add_docx_label(document, "Feedback", answer.get("feedback"))
+
+        for heading, key in (("Strengths", "strengths"), ("Areas To Improve", "improvements")):
+            items = _docx_list(report.get(key))
+            if not items:
+                continue
+            _add_docx_heading(document, heading)
+            for item in items:
+                if isinstance(item, dict):
+                    content = " — ".join(_docx_text(item.get(field)) for field in ("area", "detail") if _docx_text(item.get(field)))
+                else:
+                    content = _docx_text(item)
+                if content:
+                    document.add_paragraph(content, style="List Bullet")
+
+        if report.get("coaching_note"):
+            _add_docx_heading(document, "Coaching For Next Time")
+            document.add_paragraph(_docx_text(report["coaching_note"]))
+        if report.get("interviewer_feedback"):
+            _add_docx_heading(document, "Interviewer Feedback")
+            document.add_paragraph(_docx_text(report["interviewer_feedback"]))
+        communication = report.get("communication") or {}
+        if communication.get("notes"):
+            _add_docx_heading(document, "Communication")
+            document.add_paragraph(_docx_text(communication["notes"]))
+        skill_ratings = report.get("skill_ratings") or {}
+        if skill_ratings:
+            _add_docx_heading(document, "Skill Ratings")
+            for skill, rating in skill_ratings.items():
+                _add_docx_label(document, str(skill).replace("_", " ").title(), f"{rating}/5")
+
+    buffer = BytesIO()
+    document.save(buffer)
+    safe_company_name = re.sub(r"[^A-Za-z0-9]+", "_", company_name).strip("_") or "Company"
+    month_suffix = f"_{month}" if month else ""
+    return buffer.getvalue(), f"{safe_company_name}_Interview_Feedback{month_suffix}.docx"
+
+
+def _student_filename(report: dict, used_names: set[str] | None = None) -> str:
+    name = (report.get("student") or {}).get("name") or "Student"
+    safe_name = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_") or "Student"
+    filename = f"{safe_name}_Interview_Feedback.docx"
+    if used_names is not None and filename in used_names:
+        suffix = str(report.get("_id") or report.get("id") or "")[-6:]
+        filename = f"{safe_name}_{suffix}_Interview_Feedback.docx"
+    if used_names is not None:
+        used_names.add(filename)
+    return filename
+
+
+def _new_feedback_document(title: str) -> Document:
+    document = Document()
+    section = document.sections[0]
+    section.top_margin = Inches(0.7)
+    section.bottom_margin = Inches(0.7)
+    document.styles["Normal"].font.name = "Aptos"
+    document.styles["Normal"].font.size = Pt(10)
+    document.add_heading(title, level=0)
+    return document
+
+
+def _add_student_feedback_section(document: Document, report: dict, index: int, *, page_break: bool = False) -> None:
+    """Write only fields shown in the student feedback UI; no company summary."""
+    if page_break:
+        document.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+    name = (report.get("student") or {}).get("name") or "Student"
+    document.add_heading(f"Student {index}", level=1)
+    document.add_heading(name, level=1)
+    _add_docx_label(document, "Company", (report.get("company") or {}).get("name"))
+    _add_docx_label(document, "Role", (report.get("opportunity") or {}).get("role"))
+    interview_date = (report.get("session") or {}).get("scheduled_at") or report.get("generated_at") or report.get("created_at")
+    if interview_date:
+        date_text = f"{interview_date.month}/{interview_date.day}/{interview_date.year}" if isinstance(interview_date, datetime) else interview_date
+        _add_docx_label(document, "Interview Date", date_text)
+    _add_docx_label(document, "Status", "Published" if report.get("visible_to_student") else "Pending")
+    score = (report.get("overall") or {}).get("score")
+    if score is not None:
+        _add_docx_label(document, "Overall Score", f"{score}/10")
+
+    overall = report.get("overall") or {}
+    if overall.get("summary"):
+        _add_docx_heading(document, "Overall Feedback")
+        document.add_paragraph(_docx_text(overall["summary"]))
+    if report.get("interviewer_satisfaction"):
+        _add_docx_heading(document, "How They Met The Bar")
+        document.add_paragraph(_docx_text(report["interviewer_satisfaction"]))
+    answers = _docx_list(report.get("answers"))
+    if answers:
+        _add_docx_heading(document, "Questions & Answers")
+        for question_index, answer in enumerate(answers, start=1):
+            if not isinstance(answer, dict):
+                continue
+            document.add_heading(f"Q{question_index}. {_docx_text(answer.get('question_text'))}", level=3)
+            _add_docx_label(document, "Candidate Answer", answer.get("student_answer"))
+            accuracy = answer.get("accuracy")
+            if accuracy is not None:
+                _add_docx_label(document, "Score", f"{round(float(accuracy) / 20, 1)}/5")
+            _add_docx_label(document, "Expected", answer.get("ideal_answer"))
+            _add_docx_label(document, "Feedback", answer.get("feedback"))
+    for heading, key in (("Strengths", "strengths"), ("Areas To Improve", "improvements")):
+        items = _docx_list(report.get(key))
+        if items:
+            _add_docx_heading(document, heading)
+            for item in items:
+                content = " — ".join(_docx_text(item.get(field)) for field in ("area", "detail") if _docx_text(item.get(field))) if isinstance(item, dict) else _docx_text(item)
+                if content:
+                    document.add_paragraph(content, style="List Bullet")
+    if report.get("coaching_note"):
+        _add_docx_heading(document, "Coaching For Next Time")
+        document.add_paragraph(_docx_text(report["coaching_note"]))
+    if report.get("interviewer_feedback"):
+        _add_docx_heading(document, "Interviewer Feedback")
+        document.add_paragraph(_docx_text(report["interviewer_feedback"]))
+    communication = report.get("communication") or {}
+    if communication.get("notes"):
+        _add_docx_heading(document, "Communication")
+        document.add_paragraph(_docx_text(communication["notes"]))
+    skill_ratings = report.get("skill_ratings") or {}
+    if skill_ratings:
+        _add_docx_heading(document, "Skill Ratings")
+        for skill, rating in skill_ratings.items():
+            _add_docx_label(document, str(skill).replace("_", " ").title(), f"{rating}/5")
+    document.add_paragraph(f"End of Student {index}")
+
+
+async def build_student_feedback_export(report_ids: list[str], mode: str) -> tuple[bytes, str, str]:
+    """Build a DOCX or ZIP from selected existing report documents, in UI order."""
+    try:
+        object_ids = [to_object_id(report_id) for report_id in report_ids]
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid report id")
+    db = get_database()
+    reports = await db[INTERVIEW_REPORTS].aggregate([
+        {"$match": {"_id": {"$in": object_ids}}},
+        {"$lookup": {"from": STUDENTS, "localField": "student_id", "foreignField": "_id", "as": "student"}},
+        {"$unwind": {"path": "$student", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": COMPANIES, "localField": "company_id", "foreignField": "_id", "as": "company"}},
+        {"$unwind": {"path": "$company", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opportunity"}},
+        {"$unwind": {"path": "$opportunity", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": INTERVIEW_SESSIONS, "localField": "session_id", "foreignField": "_id", "as": "session"}},
+        {"$unwind": {"path": "$session", "preserveNullAndEmptyArrays": True}},
+    ]).to_list(length=None)
+    by_id = {str(report["_id"]): report for report in reports}
+    ordered_reports = [by_id[str(report_id)] for report_id in object_ids if str(report_id) in by_id]
+    if not ordered_reports:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No selected interview reports were found")
+
+    def save_document(document: Document) -> bytes:
+        buffer = BytesIO()
+        document.save(buffer)
+        return buffer.getvalue()
+
+    combined = None
+    if mode in {"combined", "both"}:
+        combined_doc = _new_feedback_document("Student Interview Feedback")
+        _add_docx_label(combined_doc, "Generated", datetime.now(timezone.utc).strftime("%d %B %Y"))
+        _add_docx_label(combined_doc, "Students included", len(ordered_reports))
+        _add_docx_heading(combined_doc, "Table of Contents")
+        for index, report in enumerate(ordered_reports, start=1):
+            combined_doc.add_paragraph(f"{index}. {(report.get('student') or {}).get('name') or 'Student'}")
+        for index, report in enumerate(ordered_reports, start=1):
+            _add_student_feedback_section(combined_doc, report, index, page_break=True)
+        combined = save_document(combined_doc)
+        if mode == "combined":
+            return combined, "Student_Feedback_Combined.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+    archive = BytesIO()
+    used_names: set[str] = set()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        if combined:
+            zip_file.writestr("Student_Feedback_Combined.docx", combined)
+        for index, report in enumerate(ordered_reports, start=1):
+            student_doc = _new_feedback_document("Student Interview Feedback")
+            _add_student_feedback_section(student_doc, report, index)
+            zip_file.writestr(_student_filename(report, used_names), save_document(student_doc))
+    filename = "Student_Feedback_Selected.zip" if mode == "separate" else "Student_Feedback_Selected.zip"
+    return archive.getvalue(), filename, "application/zip"
+
+
+async def build_company_feedback_export(report_ids: list[str], mode: str) -> tuple[bytes, str, str]:
+    """Build a company-oriented DOCX/ZIP from the report ids selected by UI filters."""
+    try:
+        object_ids = [to_object_id(report_id) for report_id in report_ids]
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid report id")
+    db = get_database()
+    reports = await db[INTERVIEW_REPORTS].aggregate([
+        {"$match": {"_id": {"$in": object_ids}}},
+        {"$lookup": {"from": STUDENTS, "localField": "student_id", "foreignField": "_id", "as": "student"}},
+        {"$unwind": {"path": "$student", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": COMPANIES, "localField": "company_id", "foreignField": "_id", "as": "company"}},
+        {"$unwind": {"path": "$company", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opportunity"}},
+        {"$unwind": {"path": "$opportunity", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": INTERVIEW_SESSIONS, "localField": "session_id", "foreignField": "_id", "as": "session"}},
+        {"$unwind": {"path": "$session", "preserveNullAndEmptyArrays": True}},
+    ]).to_list(length=None)
+    by_id = {str(report["_id"]): report for report in reports}
+    ordered_reports = [by_id[str(report_id)] for report_id in object_ids if str(report_id) in by_id]
+    if not ordered_reports:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No selected interview reports were found")
+
+    companies: dict[str, list[dict]] = {}
+    for report in ordered_reports:
+        name = (report.get("company") or {}).get("name") or "Company"
+        companies.setdefault(name, []).append(report)
+
+    def add_company_section(document: Document, name: str, company_reports: list[dict], *, page_break: bool = False) -> None:
+        if page_break:
+            document.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+        document.add_heading(name, level=1)
+        _add_docx_label(document, "Candidates", len(company_reports))
+        expectations = next(((report.get("session") or {}).get("company_expectations") for report in company_reports if (report.get("session") or {}).get("company_expectations")), {}) or {}
+        if expectations.get("expectations") or expectations.get("focus"):
+            _add_docx_heading(document, "What This Company Looked For")
+            if expectations.get("expectations"):
+                document.add_paragraph(_docx_text(expectations["expectations"]))
+            focus = [_docx_text(item) for item in _docx_list(expectations.get("focus")) if _docx_text(item)]
+            if focus:
+                _add_docx_label(document, "Requirement tags", " • ".join(focus))
+        _add_docx_heading(document, "Candidates")
+        for index, report in enumerate(company_reports, start=1):
+            _add_student_feedback_section(document, report, index)
+
+    def save_document(document: Document) -> bytes:
+        buffer = BytesIO()
+        document.save(buffer)
+        return buffer.getvalue()
+
+    combined = None
+    if mode in {"combined", "both"}:
+        combined_doc = _new_feedback_document("Company Interview Feedback")
+        _add_docx_label(combined_doc, "Generated", datetime.now(timezone.utc).strftime("%d %B %Y"))
+        _add_docx_label(combined_doc, "Companies included", len(companies))
+        _add_docx_heading(combined_doc, "Table of Contents")
+        for index, name in enumerate(companies, start=1):
+            combined_doc.add_paragraph(f"{index}. {name}")
+        for index, (name, company_reports) in enumerate(companies.items(), start=1):
+            add_company_section(combined_doc, name, company_reports, page_break=True)
+        combined = save_document(combined_doc)
+        if mode == "combined":
+            return combined, "Company_Feedback_Combined.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+    archive = BytesIO()
+    used_names: set[str] = set()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        if combined:
+            zip_file.writestr("Company_Feedback_Combined.docx", combined)
+        for name, company_reports in companies.items():
+            company_doc = _new_feedback_document("Company Interview Feedback")
+            add_company_section(company_doc, name, company_reports)
+            safe_name = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_") or "Company"
+            filename = f"{safe_name}_Interview_Feedback.docx"
+            if filename in used_names:
+                filename = f"{safe_name}_{str(company_reports[0].get('_id'))[-6:]}_Interview_Feedback.docx"
+            used_names.add(filename)
+            zip_file.writestr(filename, save_document(company_doc))
+    return archive.getvalue(), "Company_Feedback_Selected.zip", "application/zip"

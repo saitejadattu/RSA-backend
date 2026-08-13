@@ -20,6 +20,20 @@ class ReportVisibilityUpdate(BaseModel):
     visible_to_student: bool = True
 
 
+class StudentFeedbackExportRequest(BaseModel):
+    """Existing report ids and the requested student-feedback download format."""
+
+    report_ids: list[str] = Field(..., min_length=1, max_length=500)
+    mode: str = Field(..., pattern="^(combined|separate|both)$")
+
+
+class CompanyFeedbackExportRequest(BaseModel):
+    """Filtered report ids and the requested company-feedback download format."""
+
+    report_ids: list[str] = Field(..., min_length=1, max_length=500)
+    mode: str = Field(..., pattern="^(combined|separate|both)$")
+
+
 class TranscriptProposeRequest(BaseModel):
     raw_text: str = Field(..., min_length=1, description="Full pasted Google Meet transcript, header included.")
     opportunity_id: str | None = Field(
