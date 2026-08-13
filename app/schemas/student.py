@@ -34,3 +34,9 @@ class StudentCreate(BaseModel):
     phone: str = Field(..., min_length=6, max_length=20)
     stack: str | None = None
     resume_link: str | None = None
+
+
+class StudentPlacementUpdate(BaseModel):
+    """Placement outcome set by an administrator."""
+
+    placed_status: bool

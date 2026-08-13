@@ -402,6 +402,7 @@ async def list_admin_students(limit: int = 500) -> list[dict]:
                 "degree": student.get("degree"),
                 "department": student.get("department"),
                 "year_of_passing": student.get("year_of_passing"),
+                "placed_status": bool(student.get("placed_status")),
                 "application_count": len(student_applications),
                 "shortlisted_count": len(shortlisted),
                 "not_shortlisted_count": len(not_shortlisted),
@@ -412,6 +413,25 @@ async def list_admin_students(limit: int = 500) -> list[dict]:
         )
 
     return serialize_mongo(student_rows)
+
+
+async def update_student_placement(student_id: str, placed_status: bool) -> dict:
+    """Record the student's overall placement outcome from the admin dashboard."""
+    db = get_database()
+    try:
+        object_id = to_object_id(student_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid student id")
+
+    now = datetime.now(timezone.utc)
+    result = await db[STUDENTS].update_one(
+        {"_id": object_id},
+        {"$set": {"placed_status": placed_status, "updated_at": now}},
+    )
+    if not result.matched_count:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+
+    return serialize_mongo(await db[STUDENTS].find_one({"_id": object_id}))
 
 
 SKILL_KEYS = ("python", "nodejs", "react", "mongodb", "sql", "dsa", "javascript")
@@ -799,6 +819,7 @@ async def get_admin_student_detail(student_id: str) -> dict:
         applications.append(
             {
                 "company": a.get("company") or "Unknown",
+                "id": a.get("_id"),
                 "company_id": a.get("company_id"),
                 "opportunity_id": a.get("opportunity_id"),
                 "role": a.get("role") or "—",
@@ -913,7 +934,7 @@ async def list_admin_reports(*, published: bool | None = None, limit: int = 300)
                     "overall": 1, "communication": 1, "strengths": 1, "improvements": 1,
                     "skill_ratings": 1, "interviewer_feedback": 1, "answers": 1,
                     "interviewer_satisfaction": 1, "coaching_note": 1,
-                    "visible_to_student": 1, "generated_at": 1, "application_id": 1,
+                    "visible_to_student": 1, "generated_at": 1, "created_at": 1, "application_id": 1,
                     "company": "$co.name", "role": "$opp.role",
                     "student": {"id": "$st._id", "name": "$st.name"},
                     "company_expectations": "$sess.company_expectations",

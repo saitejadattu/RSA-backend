@@ -7,6 +7,7 @@ from app.schemas.interview_report import (
     SheetSyncRequest,
     SheetUrlRequest,
 )
+from app.schemas.student import StudentPlacementUpdate
 from app.services.admin_company_service import get_admin_company_detail, get_admin_opportunity_detail
 from app.services.admin_dashboard_service import (
     get_admin_analytics,
@@ -16,6 +17,7 @@ from app.services.admin_dashboard_service import (
     list_admin_students,
     list_pending_sessions,
     list_recent_applications,
+    update_student_placement,
 )
 from app.services.interview_report_service import list_questions, question_bank, set_report_visibility
 from app.services.sheet_import_service import (
@@ -54,6 +56,12 @@ async def students(limit: int = Query(default=500, ge=1, le=1000)) -> list[dict]
 async def student_detail(student_id: str) -> dict:
     """Full profile for one student: info, pipeline stats, applications, role mix, reports."""
     return await get_admin_student_detail(student_id)
+
+
+@router.patch("/students/{student_id}/placement")
+async def set_student_placement(student_id: str, payload: StudentPlacementUpdate) -> dict:
+    """Set whether this student has been placed."""
+    return await update_student_placement(student_id, payload.placed_status)
 
 
 @router.get("/companies/{company_id}")
