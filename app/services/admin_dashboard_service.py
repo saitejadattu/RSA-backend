@@ -1326,7 +1326,19 @@ async def build_company_feedback_export(report_ids: list[str], mode: str) -> tup
             add_company_section(combined_doc, name, company_reports, page_break=True)
         combined = save_document(combined_doc)
         if mode == "combined":
+            if len(companies) == 1:
+                safe_name = re.sub(r"[^A-Za-z0-9]+", "_", next(iter(companies))).strip("_") or "Company"
+                return combined, f"{safe_name}_Interview_Feedback.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             return combined, "Company_Feedback_Combined.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+    # One company never needs a ZIP: separate and combined output would be the
+    # same company-level document, so return a single clean DOCX instead.
+    if len(companies) == 1:
+        name, company_reports = next(iter(companies.items()))
+        company_doc = _new_feedback_document("Company Interview Feedback")
+        add_company_section(company_doc, name, company_reports)
+        safe_name = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_") or "Company"
+        return save_document(company_doc), f"{safe_name}_Interview_Feedback.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
     archive = BytesIO()
     used_names: set[str] = set()
