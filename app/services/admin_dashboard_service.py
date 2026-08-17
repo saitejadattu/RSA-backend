@@ -1214,13 +1214,24 @@ def resolve_student_export_scope(reports: list[dict], *, scope: str, student_id:
 
 async def resolve_student_report_ids(student_id: str) -> list[str]:
     """Return all report ids for a canonical student_id without using name-based grouping."""
-    try:
-        object_id = to_object_id(student_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid student id") from exc
+    return await resolve_student_ids_to_report_ids([student_id])
+
+
+async def resolve_student_ids_to_report_ids(student_ids: list[str]) -> list[str]:
+    """Resolve multiple canonical student ids to all matching report ids without using names."""
+    clean_ids = [student_id for student_id in student_ids if student_id]
+    if not clean_ids:
+        return []
+
+    object_ids: list[ObjectId] = []
+    for student_id in clean_ids:
+        try:
+            object_ids.append(to_object_id(student_id))
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid student id") from exc
 
     db = get_database()
-    reports = await db[INTERVIEW_REPORTS].find({"student_id": object_id}, {"_id": 1}).sort([("generated_at", -1), ("created_at", -1)]).to_list(length=None)
+    reports = await db[INTERVIEW_REPORTS].find({"student_id": {"$in": object_ids}}, {"_id": 1}).sort([("generated_at", -1), ("created_at", -1)]).to_list(length=None)
     return [str(report["_id"]) for report in reports]
 
 
@@ -1355,16 +1366,15 @@ async def build_student_feedback_export(
     student_id: str | None = None,
 ) -> tuple[bytes, str, str]:
     """Build a DOCX or ZIP from selected existing report documents, in UI order.
-    
-    Filename is based on scope:
-    - scope="single": StudentName_CompanyName_Interview_Feedback.docx
-    - scope="student" (all companies): StudentName_Interview_Feedback.docx
-    - scope="selected" (subset): StudentName_Selected_Companies_Interview_Feedback.docx
+
+    For multi-student exports, package all selected students into one ZIP so the
+    browser only receives a single download.
     """
     try:
         object_ids = [to_object_id(report_id) for report_id in report_ids]
     except ValueError:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid report id")
+
     db = get_database()
     reports = await db[INTERVIEW_REPORTS].aggregate([
         {"$match": {"_id": {"$in": object_ids}}},
@@ -1377,83 +1387,74 @@ async def build_student_feedback_export(
         {"$lookup": {"from": INTERVIEW_SESSIONS, "localField": "session_id", "foreignField": "_id", "as": "session"}},
         {"$unwind": {"path": "$session", "preserveNullAndEmptyArrays": True}},
     ]).to_list(length=None)
+
     by_id = {str(report["_id"]): report for report in reports}
     ordered_reports = [by_id[str(report_id)] for report_id in object_ids if str(report_id) in by_id]
     if not ordered_reports:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No selected interview reports were found")
+
+    grouped_by_student = group_reports_by_student_id(ordered_reports)
+    student_count = len(grouped_by_student)
+    first_student_name = (ordered_reports[0].get("student") or {}).get("name") or "Student"
 
     def save_document(document: Document) -> bytes:
         buffer = BytesIO()
         document.save(buffer)
         return buffer.getvalue()
 
-    student_name = (ordered_reports[0].get("student") or {}).get("name") or "Student"
-    safe_name = _sanitize_filename(student_name)
-    
-    # Count unique companies in the current export
-    selected_companies = list(set(
-        (report.get("company") or {}).get("name") or "Company"
-        for report in ordered_reports
-    ))
-    
-    # Count total companies for this student (for determining "selected" vs "all")
-    total_student_companies = selected_companies.__len__()  # Default to current count
-    if student_id and scope in {"student", "selected"}:
-        try:
-            # Query to find total unique companies for this student
-            all_student_reports = await db[INTERVIEW_REPORTS].find(
-                {"student_id": to_object_id(student_id)},
-                {"company_id": 1}
-            ).to_list(length=None)
-            total_student_companies = len(set(str(r.get("company_id")) for r in all_student_reports if r.get("company_id")))
-        except ValueError:
-            pass  # Fallback to current count if student_id is invalid
-    
-    # Determine the combined filename based on scope
-    combined_name = _export_filename_for_scope(
-        student_name, selected_companies, scope or "selected", total_student_companies
-    )
-    if mode in {"combined", "both"} and scope != "single":
-        # For combined documents, use the appropriate name
-        combined_name = _export_filename_for_scope(
-            student_name, selected_companies, scope or "selected", total_student_companies
-        )
-    elif mode in {"combined", "both"} and scope == "single":
-        # Single interview: use company name in filename
-        combined_name = _export_filename_for_scope(
-            student_name, selected_companies, "single", total_student_companies
-        )
-
-    combined = None
-    if mode in {"combined", "both"}:
-        combined_doc = _new_feedback_document("Student Interview Feedback")
-        combined_doc.add_heading("STUDENT INTERVIEW FEEDBACK", level=0)
-        combined_doc.add_paragraph(f"Student: {student_name}")
-        combined_doc.add_paragraph(f"Total Interviews: {len(ordered_reports)}")
-        _add_docx_heading(combined_doc, "Table of Contents")
-        for index, report in enumerate(ordered_reports, start=1):
+    def build_student_doc(report_list: list[dict]) -> bytes:
+        student_name = (report_list[0].get("student") or {}).get("name") or "Student"
+        student_doc = _new_feedback_document("STUDENT INTERVIEW FEEDBACK")
+        student_doc.add_paragraph(f"Student: {student_name}")
+        student_doc.add_paragraph(f"Total Interviews: {len(report_list)}")
+        student_doc.add_paragraph()
+        student_doc.add_heading("COMPANIES INTERVIEWED", level=1)
+        for index, report in enumerate(report_list, start=1):
             company_name = (report.get("company") or {}).get("name") or "Company"
-            combined_doc.add_paragraph(f"{index}. {company_name}")
-        for index, report in enumerate(ordered_reports, start=1):
-            _add_student_feedback_section(combined_doc, report, index, page_break=True)
-        combined = save_document(combined_doc)
-        if mode == "combined":
-            return combined, combined_name, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            student_doc.add_paragraph(f"{index}. {company_name}")
+        for index, report in enumerate(report_list, start=1):
+            _add_student_feedback_section(student_doc, report, index, page_break=True)
+        return save_document(student_doc)
 
-    # For separate files or combined + separate, create a ZIP
+    if mode == "combined":
+        if student_count > 1:
+            return build_student_doc(ordered_reports), "Student_Interview_Feedback_Combined.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        selected_companies = list(dict.fromkeys((report.get("company") or {}).get("name") or "Company" for report in ordered_reports))
+        combined_name = _export_filename_for_scope(first_student_name, selected_companies, scope or "selected", len(selected_companies))
+        return build_student_doc(ordered_reports), combined_name, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
     archive = BytesIO()
     used_names: set[str] = set()
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zip_file:
-        if combined:
-            # Use the properly named combined file
-            zip_file.writestr(combined_name, combined)
-        for index, report in enumerate(ordered_reports, start=1):
-            student_doc = _new_feedback_document("Student Interview Feedback")
-            _add_student_feedback_section(student_doc, report, index)
-            zip_file.writestr(_student_filename(report, used_names), save_document(student_doc))
-    
-    # ZIP filename based on whether it's combined+separate or just separate
-    zip_filename = f"{safe_name}_Interview_Feedback.zip"
+        if mode == "both":
+            if student_count > 1:
+                zip_file.writestr("Student_Interview_Feedback_Combined.docx", build_student_doc(ordered_reports))
+            else:
+                selected_companies = list(dict.fromkeys((report.get("company") or {}).get("name") or "Company" for report in ordered_reports))
+                combined_name = _export_filename_for_scope(first_student_name, selected_companies, scope or "selected", len(selected_companies))
+                zip_file.writestr(combined_name, build_student_doc(ordered_reports))
+
+        if student_count > 1:
+            for group in grouped_by_student:
+                student_name = group["student_name"] or "Student"
+                company_names = list(dict.fromkeys((report.get("company") or {}).get("name") or "Company" for report in group["reports"]))
+                filename = _export_filename_for_scope(student_name, company_names, "student", len(company_names))
+                zip_file.writestr(filename, build_student_doc(group["reports"]))
+        else:
+            for report in ordered_reports:
+                student_doc = _new_feedback_document("STUDENT INTERVIEW FEEDBACK")
+                student_name = (report.get("student") or {}).get("name") or "Student"
+                student_doc.add_paragraph(f"Student: {student_name}")
+                student_doc.add_paragraph(f"Total Interviews: {len(ordered_reports)}")
+                student_doc.add_paragraph()
+                student_doc.add_heading("COMPANIES INTERVIEWED", level=1)
+                company_name = (report.get("company") or {}).get("name") or "Company"
+                student_doc.add_paragraph(f"1. {company_name}")
+                _add_student_feedback_section(student_doc, report, 1, page_break=True)
+                filename = _student_filename(report, used_names)
+                zip_file.writestr(filename, save_document(student_doc))
+
+    zip_filename = "Student_Interview_Feedback.zip" if student_count > 1 else f"{_sanitize_filename(first_student_name)}_Interview_Feedback.zip"
     return archive.getvalue(), zip_filename, "application/zip"
 
 

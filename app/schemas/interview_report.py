@@ -24,6 +24,7 @@ class StudentFeedbackExportRequest(BaseModel):
     """Existing report ids and the requested student-feedback download format."""
 
     report_ids: list[str] = Field(default_factory=list, min_length=0, max_length=500)
+    student_ids: list[str] = Field(default_factory=list, min_length=0, max_length=500, description="Canonical student IDs for multi-student export selections.")
     mode: str = Field(..., pattern="^(combined|separate|both)$")
     scope: str = Field(default="selected", pattern="^(selected|single|student)$")
     student_id: str | None = Field(default=None, description="Canonical student ID used to resolve the full student history.")

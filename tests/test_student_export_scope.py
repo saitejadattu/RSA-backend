@@ -1,7 +1,12 @@
+import zipfile
 from datetime import datetime, timezone
+from io import BytesIO
 
 import pytest
+from docx import Document
 
+from app.schemas.interview_report import StudentFeedbackExportRequest
+from app.services import admin_dashboard_service
 from app.services.admin_dashboard_service import (
     _add_student_feedback_section,
     _export_filename_for_scope,
@@ -10,6 +15,28 @@ from app.services.admin_dashboard_service import (
     group_reports_by_student_id,
     resolve_student_export_scope,
 )
+
+
+class _FakeAggregateCursor:
+    def __init__(self, rows):
+        self.rows = rows
+
+    async def to_list(self, length=None):
+        return list(self.rows)
+
+
+class _FakeCollection:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def aggregate(self, pipeline):
+        return _FakeAggregateCursor(self.rows)
+
+
+def _mock_db_for_reports(monkeypatch, rows):
+    fake_db = {"interview_reports": _FakeCollection(rows)}
+    monkeypatch.setattr(admin_dashboard_service, "get_database", lambda: fake_db)
+    return fake_db
 
 
 def test_student_export_docx_structure_omits_marker_fields():
@@ -68,6 +95,17 @@ def test_student_scope_rejects_missing_student_id():
 
     with pytest.raises(ValueError, match="student_id"):
         resolve_student_export_scope(reports, scope="student", student_id=None)
+
+
+def test_student_export_request_accepts_student_ids():
+    payload = StudentFeedbackExportRequest(
+        report_ids=[],
+        student_ids=["student-1", "student-2"],
+        mode="combined",
+        scope="selected",
+    )
+
+    assert payload.student_ids == ["student-1", "student-2"]
 
 
 def test_single_scope_keeps_only_selected_report():
@@ -149,4 +187,191 @@ def test_export_filename_for_scope_selected_that_equals_all():
         total_student_companies=1,
     )
     assert filename == "Suhas_Pulapa_Interview_Feedback.docx"
+
+
+@pytest.mark.parametrize(
+    ("selected_count", "mode", "expected_names"),
+    [
+        (1, "combined", {"Student_Interview_Feedback.docx"}),
+        (2, "combined", {"Student_Interview_Feedback_Combined.docx"}),
+        (3, "combined", {"Student_Interview_Feedback_Combined.docx"}),
+        (4, "combined", {"Student_Interview_Feedback_Combined.docx"}),
+        (5, "combined", {"Student_Interview_Feedback_Combined.docx"}),
+        (1, "separate", {"Alpha_Company_1_Interview_Feedback.docx"}),
+        (2, "separate", {"Alpha_Interview_Feedback.docx", "Bravo_Interview_Feedback.docx"}),
+        (4, "separate", {"Alpha_Interview_Feedback.docx", "Bravo_Interview_Feedback.docx", "Charlie_Interview_Feedback.docx", "Delta_Interview_Feedback.docx"}),
+        (5, "separate", {"Alpha_Interview_Feedback.docx", "Bravo_Interview_Feedback.docx", "Charlie_Interview_Feedback.docx", "Delta_Interview_Feedback.docx", "Echo_Interview_Feedback.docx"}),
+        (2, "both", {"Student_Interview_Feedback_Combined.docx", "Alpha_Interview_Feedback.docx", "Bravo_Interview_Feedback.docx"}),
+        (5, "both", {"Student_Interview_Feedback_Combined.docx", "Alpha_Interview_Feedback.docx", "Bravo_Interview_Feedback.docx", "Charlie_Interview_Feedback.docx", "Delta_Interview_Feedback.docx", "Echo_Interview_Feedback.docx"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_bulk_student_exports_by_selected_count(monkeypatch, selected_count, mode, expected_names):
+    student_names = ["Alpha", "Bravo", "Charlie", "Delta", "Echo"]
+    reports = []
+    for index, name in enumerate(student_names[:selected_count], start=1):
+        reports.append(
+            {
+                "_id": f"64d0f71e1a2b3c4d5e6f78{index:02d}",
+                "student_id": f"student-{index}",
+                "student": {"name": name},
+                "company_id": f"company-{index}",
+                "company": {"name": f"Company {index}"},
+                "opportunity": {"role": "Frontend Engineer"},
+                "session": {"scheduled_at": datetime(2026, 8, index, tzinfo=timezone.utc)},
+                "overall": {"score": 7 + index, "summary": "Strong"},
+                "answers": [],
+            }
+        )
+
+    _mock_db_for_reports(monkeypatch, reports)
+    from app.services.admin_dashboard_service import build_student_feedback_export
+
+    content, filename, media_type = await build_student_feedback_export(
+        [report["_id"] for report in reports],
+        mode,
+        scope="selected",
+    )
+
+    if mode == "combined":
+        assert filename == "Student_Interview_Feedback_Combined.docx" if selected_count > 1 else "Student_Interview_Feedback.docx"
+        assert media_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    else:
+        expected_zip_name = "Student_Interview_Feedback.zip" if selected_count > 1 else f"{student_names[0]}_Interview_Feedback.zip"
+        assert filename == expected_zip_name
+        assert media_type == "application/zip"
+        with zipfile.ZipFile(BytesIO(content)) as archive:
+            assert set(archive.namelist()) == expected_names
+
+
+@pytest.mark.asyncio
+async def test_multi_student_separate_export_zips_student_files(monkeypatch):
+    reports = [
+        {
+            "_id": "64d0f71e1a2b3c4d5e6f7890",
+            "student_id": "student-1",
+            "student": {"name": "Bharath"},
+            "company_id": "company-1",
+            "company": {"name": "Drip Off AI"},
+            "opportunity": {"role": "Frontend Engineer"},
+            "session": {"scheduled_at": datetime(2026, 8, 6, tzinfo=timezone.utc)},
+            "overall": {"score": 7, "summary": "Strong"},
+            "answers": [],
+        },
+        {
+            "_id": "64d0f71e1a2b3c4d5e6f7891",
+            "student_id": "student-2",
+            "student": {"name": "Bhargav Martha"},
+            "company_id": "company-2",
+            "company": {"name": "Totem Interactive"},
+            "opportunity": {"role": "Data Analyst"},
+            "session": {"scheduled_at": datetime(2026, 8, 7, tzinfo=timezone.utc)},
+            "overall": {"score": 8, "summary": "Strong"},
+            "answers": [],
+        },
+    ]
+
+    _mock_db_for_reports(monkeypatch, reports)
+    from app.services.admin_dashboard_service import build_student_feedback_export
+
+    content, filename, media_type = await build_student_feedback_export(
+        ["64d0f71e1a2b3c4d5e6f7890", "64d0f71e1a2b3c4d5e6f7891"],
+        "separate",
+        scope="selected",
+    )
+
+    assert filename == "Student_Interview_Feedback.zip"
+    assert media_type == "application/zip"
+    with zipfile.ZipFile(BytesIO(content)) as archive:
+        assert set(archive.namelist()) == {"Bharath_Interview_Feedback.docx", "Bhargav_Martha_Interview_Feedback.docx"}
+
+
+@pytest.mark.asyncio
+async def test_multi_student_both_export_includes_combined_doc_and_student_files(monkeypatch):
+    reports = [
+        {
+            "_id": "64d0f71e1a2b3c4d5e6f7892",
+            "student_id": "student-1",
+            "student": {"name": "Bharath"},
+            "company_id": "company-1",
+            "company": {"name": "Drip Off AI"},
+            "opportunity": {"role": "Frontend Engineer"},
+            "session": {"scheduled_at": datetime(2026, 8, 6, tzinfo=timezone.utc)},
+            "overall": {"score": 7, "summary": "Strong"},
+            "answers": [],
+        },
+        {
+            "_id": "64d0f71e1a2b3c4d5e6f7893",
+            "student_id": "student-2",
+            "student": {"name": "Bhargav Martha"},
+            "company_id": "company-2",
+            "company": {"name": "Totem Interactive"},
+            "opportunity": {"role": "Data Analyst"},
+            "session": {"scheduled_at": datetime(2026, 8, 7, tzinfo=timezone.utc)},
+            "overall": {"score": 8, "summary": "Strong"},
+            "answers": [],
+        },
+    ]
+
+    _mock_db_for_reports(monkeypatch, reports)
+    from app.services.admin_dashboard_service import build_student_feedback_export
+
+    content, filename, media_type = await build_student_feedback_export(
+        ["64d0f71e1a2b3c4d5e6f7892", "64d0f71e1a2b3c4d5e6f7893"],
+        "both",
+        scope="selected",
+    )
+
+    assert filename == "Student_Interview_Feedback.zip"
+    assert media_type == "application/zip"
+    with zipfile.ZipFile(BytesIO(content)) as archive:
+        assert set(archive.namelist()) == {
+            "Student_Interview_Feedback_Combined.docx",
+            "Bharath_Interview_Feedback.docx",
+            "Bhargav_Martha_Interview_Feedback.docx",
+        }
+
+
+@pytest.mark.asyncio
+async def test_combined_student_export_has_single_title_and_company_heading(monkeypatch):
+    report = {
+        "_id": "64d0f71e1a2b3c4d5e6f7894",
+        "student_id": "student-10",
+        "student": {"name": "Chaitanya Jyothi"},
+        "company_id": "company-10",
+        "company": {"name": "Nexuses"},
+        "opportunity": {"role": "Software Engineer"},
+        "session": {"scheduled_at": datetime(2026, 8, 6, tzinfo=timezone.utc)},
+        "visible_to_student": True,
+        "overall": {"score": 8, "summary": "Strong overall performance."},
+        "interviewer_satisfaction": "Good depth and clarity.",
+        "answers": [{
+            "question_text": "Tell me about yourself.",
+            "student_answer": "I built a product team.",
+            "accuracy": 16,
+            "ideal_answer": "Explain background and impact.",
+            "feedback": "Clear and direct.",
+        }],
+        "strengths": ["Clear communication"],
+        "improvements": ["Need more depth in system design"],
+        "communication": {"notes": "Good communication and confidence."},
+        "skill_ratings": {"python": 4},
+    }
+
+    _mock_db_for_reports(monkeypatch, [report])
+    from app.services.admin_dashboard_service import build_student_feedback_export
+
+    content, filename, media_type = await build_student_feedback_export([report["_id"]], "combined", scope="selected")
+
+    assert filename == "Chaitanya_Jyothi_Interview_Feedback.docx"
+    assert media_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+    document = Document(BytesIO(content))
+    paragraphs = [paragraph.text for paragraph in document.paragraphs]
+    title_count = sum(1 for text in paragraphs if text == "STUDENT INTERVIEW FEEDBACK")
+    assert title_count == 1
+    assert "Student Interview Feedback" not in paragraphs
+    assert "Student: Chaitanya Jyothi" in paragraphs
+    assert "COMPANIES INTERVIEWED" in paragraphs
+    assert "1. Nexuses" in paragraphs
 

@@ -24,6 +24,7 @@ from app.services.admin_dashboard_service import (
     list_admin_students,
     list_pending_sessions,
     list_recent_applications,
+    resolve_student_ids_to_report_ids,
     resolve_student_report_ids,
     update_student_placement,
 )
@@ -153,6 +154,8 @@ async def export_student_feedback(payload: StudentFeedbackExportRequest) -> Stre
         if not payload.student_id:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="student_id is required for student-level exports")
         report_ids = await resolve_student_report_ids(payload.student_id)
+    elif payload.student_ids:
+        report_ids = await resolve_student_ids_to_report_ids(payload.student_ids)
     else:
         report_ids = payload.report_ids
 
