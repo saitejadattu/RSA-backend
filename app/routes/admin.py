@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 
@@ -24,6 +24,7 @@ from app.services.admin_dashboard_service import (
     list_admin_students,
     list_pending_sessions,
     list_recent_applications,
+    resolve_student_report_ids,
     update_student_placement,
 )
 from app.services.interview_report_service import list_questions, question_bank, set_report_visibility
@@ -146,7 +147,21 @@ async def download_company_feedback(company_id: str, month: str | None = Query(d
 @router.post("/reports/student-feedback/export")
 async def export_student_feedback(payload: StudentFeedbackExportRequest) -> StreamingResponse:
     """Export selected existing student reports as a combined DOCX and/or ZIP."""
-    content, filename, media_type = await build_student_feedback_export(payload.report_ids, payload.mode)
+    if payload.scope == "single":
+        report_ids = payload.report_ids[:1] if payload.report_ids else []
+    elif payload.scope == "student":
+        if not payload.student_id:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="student_id is required for student-level exports")
+        report_ids = await resolve_student_report_ids(payload.student_id)
+    else:
+        report_ids = payload.report_ids
+
+    if not report_ids:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No interview reports found for this export scope")
+
+    content, filename, media_type = await build_student_feedback_export(
+        report_ids, payload.mode, scope=payload.scope, student_id=payload.student_id
+    )
     return StreamingResponse(
         BytesIO(content), media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
