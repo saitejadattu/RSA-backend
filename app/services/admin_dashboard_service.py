@@ -986,7 +986,12 @@ async def list_admin_reports(*, published: bool | None = None, limit: int = 300)
                     "interviewer_satisfaction": 1, "coaching_note": 1,
                     "visible_to_student": 1, "generated_at": 1, "created_at": 1, "application_id": 1,
                     "company_id": 1, "company": "$co.name", "role": "$opp.role",
-                    "student": {"id": "$st._id", "name": "$st.name"},
+                    "student_id": 1,
+                    "student": {
+                        "id": "$st._id",
+                        "name": "$st.name",
+                        "phone": "$st.phone",
+                    },
                     "company_expectations": "$sess.company_expectations",
                     "interview_date": 1,
                     "sess": "$sess",
@@ -1243,15 +1248,20 @@ def group_reports_by_student_id(reports: list[dict]) -> list[dict]:
         student_id = _canonical_student_id(report)
         if not student_id:
             continue
+        student = report.get("student") or {}
         entry = grouped.setdefault(
             student_id,
             {
                 "student_id": student_id,
-                "student_name": (report.get("student") or {}).get("name") or "Student",
+                "student_name": student.get("name") or "Student",
+                "student_phone": student.get("phone") or student.get("mobile") or "",
                 "reports": [],
                 "company_keys": set(),
             },
         )
+        if not entry["student_phone"]:
+            phone = (student.get("phone") or student.get("mobile") or "")
+            entry["student_phone"] = phone
         entry["reports"].append(report)
         company_key = _canonical_company_key(report)
         if company_key is not None:
@@ -1263,6 +1273,7 @@ def group_reports_by_student_id(reports: list[dict]) -> list[dict]:
             {
                 "student_id": group["student_id"],
                 "student_name": group["student_name"],
+                "student_phone": group["student_phone"],
                 "reports": group["reports"],
                 "company_count": len(group["company_keys"]),
                 "interview_count": len(group["reports"]),

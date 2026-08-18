@@ -57,17 +57,45 @@ class _FakeReportsCollection:
                         if match["visible_to_student"] == {"$ne": True} and item.get("visible_to_student"):
                             item = None
                             break
+                if "$lookup" in stage:
+                    lookup = stage["$lookup"]
+                    local_field = lookup.get("localField")
+                    foreign_collection = lookup.get("from")
+                    if local_field and foreign_collection in {"interview_sessions", "transcripts", "students", "companies", "hiring_opportunities"}:
+                        value = item.get(local_field)
+                        if value is not None:
+                            key = str(value)
+                            if foreign_collection == "interview_sessions":
+                                item[f"{lookup.get('as')}"] = self.sessions.get(key, {})
+                            elif foreign_collection == "transcripts":
+                                item[f"{lookup.get('as')}"] = self.transcripts.get(key, {})
+                            elif foreign_collection == "students":
+                                item[f"{lookup.get('as')}"] = self.students.get(key, {})
+                            elif foreign_collection == "companies":
+                                item[f"{lookup.get('as')}"] = self.companies.get(key, {})
+                            elif foreign_collection == "hiring_opportunities":
+                                item[f"{lookup.get('as')}"] = self.opportunities.get(key, {})
+
+                if "$unwind" in stage:
+                    unwind = stage["$unwind"]
+                    path = unwind.get("path")
+                    if path and isinstance(item.get(path[1:]), dict):
+                        arr = item.get(path[1:])
+                        if arr:
+                            item[path[1:]] = arr
+                        else:
+                            item[path[1:]] = {}
+
             if item is None:
                 continue
 
-            # Return raw projected document with joined objects
             projected = {
                 "_id": item.get("_id"),
-                "student": {"id": st.get("_id"), "name": st.get("name")},
+                "student": {"id": item.get("st", {}).get("_id") or st.get("_id"), "name": item.get("st", {}).get("name") or st.get("name"), "phone": item.get("st", {}).get("phone") or st.get("phone")},
                 "student_id": item.get("student_id"),
                 "company_id": item.get("company_id"),
-                "company": co.get("name") if isinstance(co, dict) else co,
-                "role": opp.get("role") if isinstance(opp, dict) else opp,
+                "company": item.get("co", {}).get("name") if isinstance(item.get("co"), dict) else co.get("name") if isinstance(co, dict) else co,
+                "role": item.get("opp", {}).get("role") if isinstance(item.get("opp"), dict) else opp.get("role") if isinstance(opp, dict) else opp,
                 "opportunity_id": item.get("opportunity_id"),
                 "visible_to_student": item.get("visible_to_student", False),
                 "interview_date": item.get("interview_date"),
@@ -75,10 +103,10 @@ class _FakeReportsCollection:
                 "created_at": item.get("created_at"),
                 "overall": item.get("overall", {}),
                 "answers": item.get("answers", []),
-                "session": sess,
-                "sess": sess,
-                "transcript": tr,
-                "tr": tr,
+                "session": item.get("sess") or sess,
+                "sess": item.get("sess") or sess,
+                "transcript": item.get("tr") or tr,
+                "tr": item.get("tr") or tr,
             }
             results.append(projected)
 
