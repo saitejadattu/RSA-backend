@@ -223,9 +223,208 @@ def transcript_to_text(segments: list[dict[str, Any]], *, limit: int | None = No
 
 # --- header ------------------------------------------------------------------
 
-HEADER_DATE_FORMATS = ("%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y", "%Y-%m-%d", "%d-%m-%Y")
+HEADER_DATE_FORMATS = (
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d %H:%M",
+    "%Y/%m/%d",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d",
+    "%d/%m/%Y %H:%M:%S",
+    "%d/%m/%Y %H:%M",
+    "%d/%m/%Y",
+    "%d-%m-%Y %H:%M:%S",
+    "%d-%m-%Y %H:%M",
+    "%d-%m-%Y",
+    "%b %d, %Y, %I:%M %p",
+    "%B %d, %Y, %I:%M %p",
+    "%b %d, %Y %H:%M",
+    "%B %d, %Y %H:%M",
+    "%b %d, %Y",
+    "%B %d, %Y",
+    "%b %d %Y",
+    "%B %d %Y",
+    "%d %b %Y",
+    "%d %B %Y",
+    "%d %b, %Y",
+    "%d %B, %Y",
+    "%d-%b-%Y",
+    "%d-%B-%Y",
+    "%m/%d/%Y %H:%M:%S",
+    "%m/%d/%Y %H:%M",
+    "%m/%d/%Y",
+    "%m-%d-%Y",
+)
 # "Interviews | Nxtwave X WeSee  - Transcript" -> "WeSee"
 HOST_ORGS = ("nxtwave", "niat")
+
+
+def extract_header_date(line: str) -> datetime | None:
+    """Extract and parse meeting date from a header line with various formats."""
+    return extract_date_from_text(line)
+
+
+def extract_date_from_text(text: str | None) -> datetime | None:
+    """Extract an interview date from arbitrary text (title, company_hint, raw_text, etc.)."""
+    if not text or not isinstance(text, str):
+        return None
+
+    # 1. Regex pattern for YYYY/MM/DD or YYYY-MM-DD (with optional HH:MM[:SS])
+    # e.g., "2026/06/30 14:56 IST", "2026-07-29 15:57", "2026/07/29"
+    ymd_pattern = re.search(
+        r"\b(\d{4})[/-](\d{1,2})[/-](\d{1,2})(?:[\s,T]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?\b",
+        text,
+    )
+    if ymd_pattern:
+        try:
+            year = int(ymd_pattern.group(1))
+            month = int(ymd_pattern.group(2))
+            day = int(ymd_pattern.group(3))
+            hour = int(ymd_pattern.group(4)) if ymd_pattern.group(4) is not None else 0
+            minute = int(ymd_pattern.group(5)) if ymd_pattern.group(5) is not None else 0
+            second = int(ymd_pattern.group(6)) if ymd_pattern.group(6) is not None else 0
+            if 1900 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31:
+                return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+        except (ValueError, OverflowError):
+            pass
+
+    # 2. Regex pattern for DD/MM/YYYY or DD-MM-YYYY (with optional HH:MM[:SS])
+    # e.g., "30/06/2026 14:56", "29-07-2026"
+    dmy_pattern = re.search(
+        r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})(?:[\s,T]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?\b",
+        text,
+    )
+    if dmy_pattern:
+        try:
+            day = int(dmy_pattern.group(1))
+            month = int(dmy_pattern.group(2))
+            year = int(dmy_pattern.group(3))
+            hour = int(dmy_pattern.group(4)) if dmy_pattern.group(4) is not None else 0
+            minute = int(dmy_pattern.group(5)) if dmy_pattern.group(5) is not None else 0
+            second = int(dmy_pattern.group(6)) if dmy_pattern.group(6) is not None else 0
+            if month > 12 and 1 <= day <= 12:
+                day, month = month, day
+            if 1900 <= year <= 2100 and 1 <= month <= 12 and 1 <= day <= 31:
+                return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+        except (ValueError, OverflowError):
+            pass
+
+    # 3. Month name patterns: "July 29, 2026", "29 July 2026", "Jul 29 2026 15:57"
+    month_names = "Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|January|February|March|April|May|June|July|August|September|October|November|December"
+    m_name_1 = re.search(
+        rf"\b({month_names})\s+(\d{{1,2}})(?:st|nd|rd|th)?,?\s+(\d{{4}})(?:[\s,T]+(\d{{1,2}}):(\d{{2}}))?",
+        text,
+        re.IGNORECASE,
+    )
+    if m_name_1:
+        try:
+            m_str, d_str, y_str = m_name_1.group(1), m_name_1.group(2), m_name_1.group(3)
+            hour = int(m_name_1.group(4)) if m_name_1.group(4) is not None else 0
+            minute = int(m_name_1.group(5)) if m_name_1.group(5) is not None else 0
+            parsed_dt = datetime.strptime(f"{m_str} {d_str} {y_str}", "%b %d %Y" if len(m_str) <= 3 else "%B %d %Y")
+            return parsed_dt.replace(hour=hour, minute=minute, tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    m_name_2 = re.search(
+        rf"\b(\d{{1,2}})(?:st|nd|rd|th)?[\s-]+({month_names})[\s-,]+(\d{{4}})(?:[\s,T]+(\d{{1,2}}):(\d{{2}}))?",
+        text,
+        re.IGNORECASE,
+    )
+    if m_name_2:
+        try:
+            d_str, m_str, y_str = m_name_2.group(1), m_name_2.group(2), m_name_2.group(3)
+            hour = int(m_name_2.group(4)) if m_name_2.group(4) is not None else 0
+            minute = int(m_name_2.group(5)) if m_name_2.group(5) is not None else 0
+            parsed_dt = datetime.strptime(f"{d_str} {m_str} {y_str}", "%d %b %Y" if len(m_str) <= 3 else "%d %B %Y")
+            return parsed_dt.replace(hour=hour, minute=minute, tzinfo=timezone.utc)
+        except ValueError:
+            pass
+
+    # 4. Check first few lines individually
+    lines = [line.strip() for line in text.splitlines()[:10] if line.strip()]
+    for line in lines:
+        d = extract_header_date(line)
+        if d is not None:
+            return d
+
+    return None
+
+
+def resolve_interview_date(
+    report: dict | None = None,
+    session: dict | None = None,
+    transcript: dict | None = None,
+) -> datetime | str | None:
+    """Resolve the interview occurrence date following the strict 9-tier priority:
+    1. interview_date (on report or session)
+    2. scheduled_at (on session or report)
+    3. started_at (on session or report)
+    4. meeting_date (on transcript, session, or report)
+    5. Date extracted from transcript title
+    6. Date extracted from transcript company_hint
+    7. Date extracted from transcript raw_text
+    8. generated_at (on report)
+    9. created_at (on report, session, or transcript)
+
+    Never falls back to 'now'.
+    """
+    report = report or {}
+    session = session or report.get("session") or report.get("sess") or {}
+    transcript = transcript or report.get("transcript") or report.get("tr") or {}
+
+    # 1. interview_date
+    val = report.get("interview_date") or session.get("interview_date") or transcript.get("interview_date")
+    if val:
+        return val
+
+    # 2. scheduled_at
+    val = session.get("scheduled_at") or report.get("scheduled_at")
+    if val:
+        return val
+
+    # 3. started_at
+    val = session.get("started_at") or report.get("started_at")
+    if val:
+        return val
+
+    # 4. meeting_date
+    val = transcript.get("meeting_date") or session.get("meeting_date") or report.get("meeting_date")
+    if val:
+        return val
+
+    # 5. Date extracted from transcript title
+    title = transcript.get("title") or session.get("title") or report.get("title")
+    if title:
+        d = extract_date_from_text(title)
+        if d:
+            return d
+
+    # 6. Date extracted from company_hint
+    company_hint = transcript.get("company_hint") or session.get("company_hint") or report.get("company_hint")
+    if company_hint:
+        d = extract_date_from_text(company_hint)
+        if d:
+            return d
+
+    # 7. Date extracted from transcript raw_text
+    raw_text = transcript.get("raw_text") or session.get("raw_text") or report.get("raw_text")
+    if raw_text:
+        d = extract_date_from_text(raw_text)
+        if d:
+            return d
+
+    # 8. generated_at
+    val = report.get("generated_at") or session.get("generated_at")
+    if val:
+        return val
+
+    # 9. created_at
+    val = report.get("created_at") or session.get("created_at") or transcript.get("created_at")
+    if val:
+        return val
+
+    return None
 
 
 def parse_header(raw_text: str) -> dict[str, Any]:
@@ -240,17 +439,16 @@ def parse_header(raw_text: str) -> dict[str, Any]:
     title: str | None = None
 
     for line in lines:
-        if meeting_date is None:
-            for fmt in HEADER_DATE_FORMATS:
-                try:
-                    meeting_date = datetime.strptime(line, fmt).replace(tzinfo=timezone.utc)
-                    break
-                except ValueError:
-                    continue
-            if meeting_date is not None:
-                continue
         if title is None and "transcript" in line.lower():
             title = line
+        if meeting_date is None:
+            meeting_date = extract_header_date(line)
+
+    # If meeting_date is not found yet, check if title or raw_text contains the date
+    if meeting_date is None and title:
+        meeting_date = extract_date_from_text(title)
+    if meeting_date is None:
+        meeting_date = extract_date_from_text(raw_text)
 
     company_hint = None
     if title:
@@ -262,7 +460,11 @@ def parse_header(raw_text: str) -> dict[str, Any]:
             for part in parts
             if part.strip() and not any(host in part.lower() for host in HOST_ORGS)
         ]
-        company_hint = candidates[0] if candidates else None
+        if candidates:
+            # Strip embedded date from company hint, e.g. "GTMER - 2026/06/30 14:56 IST" -> "GTMER"
+            hint = candidates[0]
+            hint_cleaned = re.sub(r"\s*-\s*\d{4}[/-]\d{1,2}[/-]\d{1,2}.*$", "", hint).strip()
+            company_hint = hint_cleaned if hint_cleaned else hint
 
     return {"meeting_date": meeting_date, "title": title, "company_hint": company_hint}
 

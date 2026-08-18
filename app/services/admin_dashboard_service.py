@@ -20,8 +20,26 @@ from app.db.collections import (
 )
 from app.db.mongodb import get_database
 from app.models.application import normalize_application_status
+from app.services.transcript_service import resolve_interview_date
 from app.utils.mongo import serialize_mongo
 from app.utils.object_id import to_object_id
+
+
+def _sort_key_for_date(val: object) -> datetime:
+    """Normalize various date representations into a UTC datetime for sorting and comparisons."""
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=timezone.utc)
+        return val.astimezone(timezone.utc)
+    if isinstance(val, str) and val.strip():
+        try:
+            dt = datetime.fromisoformat(val.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except ValueError:
+            pass
+    return datetime.min.replace(tzinfo=timezone.utc)
 
 
 REAL_APPLICATION_FILTER = {
@@ -776,7 +794,10 @@ async def get_admin_student_detail(student_id: str) -> dict:
     ]
     reports_pipeline = [
         {"$match": {"student_id": oid}},
-        {"$sort": {"generated_at": -1, "created_at": -1}},
+        {"$lookup": {"from": INTERVIEW_SESSIONS, "localField": "session_id", "foreignField": "_id", "as": "sess"}},
+        {"$unwind": {"path": "$sess", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": TRANSCRIPTS, "localField": "session_id", "foreignField": "session_id", "as": "tr"}},
+        {"$unwind": {"path": "$tr", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": COMPANIES, "localField": "company_id", "foreignField": "_id", "as": "co"}},
         {"$unwind": {"path": "$co", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opp"}},
@@ -791,14 +812,18 @@ async def get_admin_student_detail(student_id: str) -> dict:
                 "interviewer_feedback": 1,
                 "visible_to_student": 1,
                 "generated_at": 1,
+                "created_at": 1,
                 "company": "$co.name",
                 "role": "$opp.role",
+                "interview_date": 1,
+                "sess": "$sess",
+                "tr": "$tr",
             }
         },
     ]
     # All three are keyed only by the student id and independent of each other —
     # run them as one parallel batch instead of three serial round trips.
-    student, app_rows, reports = await asyncio.gather(
+    student, app_rows, raw_reports = await asyncio.gather(
         db[STUDENTS].find_one({"_id": oid}),
         db[APPLICATIONS].aggregate(app_pipeline).to_list(length=None),
         db[INTERVIEW_REPORTS].aggregate(reports_pipeline).to_list(length=None),
@@ -840,6 +865,26 @@ async def get_admin_student_detail(student_id: str) -> dict:
             }
         )
     role_breakdown = sorted([{"category": k, "n": v} for k, v in role_counts.items()], key=lambda x: -x["n"])
+
+    reports = []
+    for r in raw_reports:
+        sess = r.get("sess") or {}
+        tr = r.get("tr") or {}
+        r["interview_date"] = resolve_interview_date(r, session=sess, transcript=tr)
+        r["scheduled_at"] = sess.get("scheduled_at")
+        r["meeting_date"] = tr.get("meeting_date")
+        r.pop("sess", None)
+        r.pop("tr", None)
+        reports.append(r)
+
+    reports.sort(
+        key=lambda r: (
+            _sort_key_for_date(r.get("interview_date")),
+            _sort_key_for_date(r.get("generated_at")),
+            _sort_key_for_date(r.get("created_at")),
+        ),
+        reverse=True,
+    )
 
     return serialize_mongo(
         {
@@ -924,16 +969,16 @@ async def list_admin_reports(*, published: bool | None = None, limit: int = 300)
     reports = await db[INTERVIEW_REPORTS].aggregate(
         [
             {"$match": match},
-            {"$sort": {"generated_at": -1, "created_at": -1}},
-            {"$limit": limit},
+            {"$lookup": {"from": INTERVIEW_SESSIONS, "localField": "session_id", "foreignField": "_id", "as": "sess"}},
+            {"$unwind": {"path": "$sess", "preserveNullAndEmptyArrays": True}},
+            {"$lookup": {"from": TRANSCRIPTS, "localField": "session_id", "foreignField": "session_id", "as": "tr"}},
+            {"$unwind": {"path": "$tr", "preserveNullAndEmptyArrays": True}},
             {"$lookup": {"from": STUDENTS, "localField": "student_id", "foreignField": "_id", "as": "st"}},
             {"$unwind": {"path": "$st", "preserveNullAndEmptyArrays": True}},
             {"$lookup": {"from": COMPANIES, "localField": "company_id", "foreignField": "_id", "as": "co"}},
             {"$unwind": {"path": "$co", "preserveNullAndEmptyArrays": True}},
             {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opp"}},
             {"$unwind": {"path": "$opp", "preserveNullAndEmptyArrays": True}},
-            {"$lookup": {"from": INTERVIEW_SESSIONS, "localField": "session_id", "foreignField": "_id", "as": "sess"}},
-            {"$unwind": {"path": "$sess", "preserveNullAndEmptyArrays": True}},
             {
                 "$project": {
                     "overall": 1, "communication": 1, "strengths": 1, "improvements": 1,
@@ -943,10 +988,34 @@ async def list_admin_reports(*, published: bool | None = None, limit: int = 300)
                     "company_id": 1, "company": "$co.name", "role": "$opp.role",
                     "student": {"id": "$st._id", "name": "$st.name"},
                     "company_expectations": "$sess.company_expectations",
+                    "interview_date": 1,
+                    "sess": "$sess",
+                    "tr": "$tr",
                 }
             },
         ]
     ).to_list(length=None)
+
+    for r in reports:
+        sess = r.get("sess") or {}
+        tr = r.get("tr") or {}
+        r["interview_date"] = resolve_interview_date(r, session=sess, transcript=tr)
+        r["scheduled_at"] = sess.get("scheduled_at")
+        r["meeting_date"] = tr.get("meeting_date")
+        r.pop("sess", None)
+        r.pop("tr", None)
+
+    reports.sort(
+        key=lambda r: (
+            _sort_key_for_date(r.get("interview_date")),
+            _sort_key_for_date(r.get("generated_at")),
+            _sort_key_for_date(r.get("created_at")),
+        ),
+        reverse=True,
+    )
+    if limit:
+        reports = reports[:limit]
+
     return serialize_mongo(reports)
 
 
@@ -990,31 +1059,49 @@ async def build_company_feedback_docx(company_id: str, month: str | None = None)
     if not company:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Company not found")
 
-    report_match: dict = {"company_id": company_object_id}
+    pipeline: list[dict] = [
+        {"$match": {"company_id": company_object_id}},
+        {"$lookup": {"from": INTERVIEW_SESSIONS, "localField": "session_id", "foreignField": "_id", "as": "session"}},
+        {"$unwind": {"path": "$session", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": TRANSCRIPTS, "localField": "session_id", "foreignField": "session_id", "as": "transcript"}},
+        {"$unwind": {"path": "$transcript", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": STUDENTS, "localField": "student_id", "foreignField": "_id", "as": "student"}},
+        {"$unwind": {"path": "$student", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opportunity"}},
+        {"$unwind": {"path": "$opportunity", "preserveNullAndEmptyArrays": True}},
+    ]
+
+    all_reports = await db[INTERVIEW_REPORTS].aggregate(pipeline).to_list(length=None)
+
+    for r in all_reports:
+        sess = r.get("session") or {}
+        tr = r.get("transcript") or {}
+        r["interview_date"] = resolve_interview_date(r, session=sess, transcript=tr)
+
+    all_reports.sort(
+        key=lambda r: (
+            _sort_key_for_date(r.get("interview_date")),
+            _sort_key_for_date(r.get("generated_at")),
+            _sort_key_for_date(r.get("created_at")),
+        ),
+        reverse=True,
+    )
+
     if month:
         try:
             start = datetime.strptime(month, "%Y-%m").replace(tzinfo=timezone.utc)
         except ValueError:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Month must use YYYY-MM format")
         end = datetime(start.year + (start.month == 12), (start.month % 12) + 1, 1, tzinfo=timezone.utc)
-        # The list view uses generated_at and falls back to created_at for older
-        # reports; the export follows the exact same rule.
-        report_match["$or"] = [
-            {"generated_at": {"$gte": start, "$lt": end}},
-            {"generated_at": {"$exists": False}, "created_at": {"$gte": start, "$lt": end}},
-        ]
 
-    reports = await db[INTERVIEW_REPORTS].aggregate([
-        {"$match": report_match},
-        # Match the report-list order: newest report first.
-        {"$sort": {"generated_at": -1, "created_at": -1}},
-        {"$lookup": {"from": STUDENTS, "localField": "student_id", "foreignField": "_id", "as": "student"}},
-        {"$unwind": {"path": "$student", "preserveNullAndEmptyArrays": True}},
-        {"$lookup": {"from": HIRING_OPPORTUNITIES, "localField": "opportunity_id", "foreignField": "_id", "as": "opportunity"}},
-        {"$unwind": {"path": "$opportunity", "preserveNullAndEmptyArrays": True}},
-        {"$lookup": {"from": INTERVIEW_SESSIONS, "localField": "session_id", "foreignField": "_id", "as": "session"}},
-        {"$unwind": {"path": "$session", "preserveNullAndEmptyArrays": True}},
-    ]).to_list(length=None)
+        reports = []
+        for r in all_reports:
+            idate = r.get("interview_date")
+            dt = _sort_key_for_date(idate)
+            if dt != datetime.min.replace(tzinfo=timezone.utc) and start <= dt < end:
+                reports.append(r)
+    else:
+        reports = all_reports
 
     if not reports:
         scope = f" for {month}" if month else ""
@@ -1058,9 +1145,9 @@ async def build_company_feedback_docx(company_id: str, month: str | None = None)
         score = (report.get("overall") or {}).get("score")
         if score is not None:
             _add_docx_label(document, "Score", f"{score}/10")
-        interview_date = (report.get("session") or {}).get("scheduled_at") or report.get("generated_at") or report.get("created_at")
+        interview_date = resolve_interview_date(report, session=report.get("session"), transcript=report.get("transcript"))
         if interview_date:
-            date_text = f"{interview_date.month}/{interview_date.day}/{interview_date.year}" if isinstance(interview_date, datetime) else interview_date
+            date_text = f"{interview_date.month}/{interview_date.day}/{interview_date.year}" if isinstance(interview_date, datetime) else str(interview_date)
             _add_docx_label(document, "Interview Date", date_text)
         _add_docx_label(document, "Status", "Published" if report.get("visible_to_student") else "Pending")
 
@@ -1307,9 +1394,9 @@ def _add_student_feedback_section(document: Document, report: dict, index: int, 
     document.add_heading(company_name, level=1)
     _add_docx_label(document, "Role", (report.get("opportunity") or {}).get("role"))
 
-    interview_date = (report.get("session") or {}).get("scheduled_at") or report.get("generated_at") or report.get("created_at")
+    interview_date = resolve_interview_date(report, session=report.get("session"), transcript=report.get("transcript"))
     if interview_date:
-        date_text = f"{interview_date.month}/{interview_date.day}/{interview_date.year}" if isinstance(interview_date, datetime) else interview_date
+        date_text = f"{interview_date.month}/{interview_date.day}/{interview_date.year}" if isinstance(interview_date, datetime) else str(interview_date)
         _add_docx_label(document, "Interview Date", date_text)
 
     score = (report.get("overall") or {}).get("score")
@@ -1386,6 +1473,8 @@ async def build_student_feedback_export(
         {"$unwind": {"path": "$opportunity", "preserveNullAndEmptyArrays": True}},
         {"$lookup": {"from": INTERVIEW_SESSIONS, "localField": "session_id", "foreignField": "_id", "as": "session"}},
         {"$unwind": {"path": "$session", "preserveNullAndEmptyArrays": True}},
+        {"$lookup": {"from": TRANSCRIPTS, "localField": "session_id", "foreignField": "session_id", "as": "transcript"}},
+        {"$unwind": {"path": "$transcript", "preserveNullAndEmptyArrays": True}},
     ]).to_list(length=None)
 
     by_id = {str(report["_id"]): report for report in reports}

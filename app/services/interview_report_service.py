@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import difflib
 import hashlib
 import re
@@ -35,8 +36,10 @@ from app.services.transcript_service import (
     candidate_blocks,
     detect_interviewer,
     distinct_speakers,
+    extract_date_from_text,
     parse_header,
     parse_transcript,
+    resolve_interview_date,
     transcript_to_text,
 )
 from app.utils.mongo import serialize_mongo
@@ -525,7 +528,8 @@ async def save_transcript(session_id: str, *, raw_text: str, source: str = "past
     students = await _session_students(db, session)
     speakers = distinct_speakers(segments)
     speaker_map = build_speaker_map(speakers, students)
-    now = utc_now()
+    header = parse_header(raw_text)
+    meeting_date = header.get("meeting_date")
 
     document = {
         "session_id": session_object_id,
@@ -533,6 +537,9 @@ async def save_transcript(session_id: str, *, raw_text: str, source: str = "past
         "opportunity_id": session.get("opportunity_id"),
         "source": source,
         "source_link": session.get("transcript_drive_link"),
+        "title": header.get("title"),
+        "meeting_date": meeting_date,
+        "company_hint": header.get("company_hint"),
         "raw_text": raw_text,
         "segments": segments,
         "speaker_map": speaker_map,
@@ -547,9 +554,14 @@ async def save_transcript(session_id: str, *, raw_text: str, source: str = "past
         result = await db[TRANSCRIPTS].insert_one(document)
         transcript_id = result.inserted_id
 
+    session_update = {"transcript_status": "uploaded", "ai_status": "not_started", "updated_at": now}
+    if meeting_date and not session.get("scheduled_at"):
+        session_update["scheduled_at"] = meeting_date
+        session_update["started_at"] = meeting_date
+
     await db[INTERVIEW_SESSIONS].update_one(
         {"_id": session_object_id},
-        {"$set": {"transcript_status": "uploaded", "ai_status": "not_started", "updated_at": now}},
+        {"$set": session_update},
     )
 
     return serialize_mongo(
@@ -879,6 +891,20 @@ async def analyze_session(session_id: str) -> dict:
         )
         all_question_keys.update(key_to_id.keys())
 
+        # Resolve interview date according to canonical 9-tier priority
+        interview_date = resolve_interview_date(
+            session=session,
+            transcript=transcript,
+        )
+        if interview_date and isinstance(interview_date, datetime):
+            if transcript and not transcript.get("meeting_date"):
+                await db[TRANSCRIPTS].update_one({"_id": transcript["_id"]}, {"$set": {"meeting_date": interview_date}})
+            if not session.get("scheduled_at"):
+                await db[INTERVIEW_SESSIONS].update_one(
+                    {"_id": session_object_id, "scheduled_at": None},
+                    {"$set": {"scheduled_at": interview_date, "started_at": interview_date}},
+                )
+
         report = analysis.get("report") or {}
         document = {
             "session_id": session_object_id,
@@ -924,6 +950,7 @@ async def analyze_session(session_id: str) -> dict:
             "ai_provider": analysis.get("_provider"),
             "ai_status": "completed",
             "transcript_truncated": bool(analysis.get("_truncated")),
+            "interview_date": interview_date,
             "generated_at": now,
             "updated_at": now,
         }
