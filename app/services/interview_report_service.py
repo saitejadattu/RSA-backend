@@ -725,9 +725,24 @@ OPPORTUNITY_IN_PROGRESS = "Hiring-in-progress"
 OPPORTUNITY_OPEN_STATUSES = {None, "", "Yet To Schedule Interviews"}
 
 
+FINAL_APPLICATION_STATUSES = {
+    "SELECTED",
+    "OFFER_PENDING",
+    "OFFER_RELEASED",
+    "OFFER_ACCEPTED",
+    "OFFER_REJECTED",
+    "JOINED",
+    "REJECTED",
+    "DROPPED",
+}
+
+
 async def _record_status(db, *, application, new_status, reason, now) -> None:
     """Move one application to new_status and log the change for the audit trail."""
     old_status = application.get("current_status")
+    # Never automatically downgrade or overwrite a finalized application status
+    if old_status in FINAL_APPLICATION_STATUSES:
+        return
     await db[APPLICATIONS].update_one(
         {"_id": application["_id"]},
         {"$set": {"current_status": new_status, "updated_at": now}},

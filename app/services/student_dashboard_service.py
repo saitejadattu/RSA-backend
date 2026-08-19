@@ -93,6 +93,7 @@ async def list_student_applications(student: dict, *, include_not_interested: bo
                     "role": "$opportunity.role",
                     "tech_stack": "$opportunity.tech_stack",
                     "must_have_skills": "$opportunity.must_have_skills",
+                    "student_side_status": "$opportunity.student_side_status",
                     "location": "$opportunity.location",
                     "stipend": "$opportunity.stipend",
                     "duration": "$opportunity.duration",
@@ -113,6 +114,9 @@ async def list_student_applications(student: dict, *, include_not_interested: bo
 # backup who may still be pulled in, so the student is never shown that status.
 _REJECT_DECISIONS = {"not_shortlisted", "selected_elsewhere", "resume_not_found"}
 _FORWARD_STATUSES = {"SELECTED", "JOINED", "OFFER_ACCEPTED", "OFFER_RELEASED", "OFFER_PENDING"}
+_DEFAULT_REJECTION_REMARK = "Profile does not align with internship requirements"
+_NO_STUDENT_ELIGIBLE = "No Student Eligble"
+_REMARK_STATUS_CONTEXTS = {_NO_STUDENT_ELIGIBLE, "Shared Profiles with CRM"}
 
 
 def _apply_student_outcome(application: dict) -> None:
@@ -127,9 +131,13 @@ def _apply_student_outcome(application: dict) -> None:
     decision = str(application.get("_decision") or "").lower()
     shortlist_done = bool(application.get("_shortlist_done"))
     remark = application.get("_remark")
+    opportunity = application.get("opportunity") or {}
+    student_side_status = str(opportunity.get("student_side_status") or "").strip()
 
     if application.get("is_interested") is False or status in {"DROPPED", "NOT_INTERESTED"}:
         outcome = "declined"
+    elif status == "REJECTED":
+        outcome = "rejected"
     elif status == "INTERVIEW_COMPLETED":
         outcome = "interview_done"
     elif status == "INTERVIEW_NOT_ATTENDED":
@@ -146,14 +154,25 @@ def _apply_student_outcome(application: dict) -> None:
         outcome = "pending"
     elif decision in _REJECT_DECISIONS:
         outcome = "not_shortlisted"
+    elif status == "APPLIED" and student_side_status == _NO_STUDENT_ELIGIBLE:
+        outcome = "not_shortlisted"
     elif shortlist_done and status == "APPLIED":
         outcome = "not_shortlisted"
     else:
         outcome = "pending"
 
-    show_remark = outcome == "not_shortlisted" and decision in _REJECT_DECISIONS
+    show_remark = outcome in {"not_shortlisted", "rejected"} or (
+        status == "APPLIED" and student_side_status in _REMARK_STATUS_CONTEXTS
+    )
     application["student_outcome"] = outcome
-    application["screening_remark"] = remark if show_remark else None
+    has_remark = isinstance(remark, str) and bool(remark.strip())
+    application["screening_remark"] = (
+        remark
+        if has_remark and show_remark
+        else _DEFAULT_REJECTION_REMARK
+        if status == "APPLIED" and student_side_status == _NO_STUDENT_ELIGIBLE
+        else None
+    )
     application["screening_decision"] = decision if show_remark else None
     for key in ("_decision", "_remark", "_shortlist_done"):
         application.pop(key, None)

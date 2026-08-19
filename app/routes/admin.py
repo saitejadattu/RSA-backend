@@ -12,7 +12,11 @@ from app.schemas.interview_report import (
     SheetUrlRequest,
 )
 from app.schemas.student import StudentPlacementUpdate
-from app.services.admin_company_service import get_admin_company_detail, get_admin_opportunity_detail
+from app.services.admin_company_service import (
+    bulk_reject_interviewed,
+    get_admin_company_detail,
+    get_admin_opportunity_detail,
+)
 from app.services.admin_dashboard_service import (
     get_admin_analytics,
     get_admin_dashboard,
@@ -245,3 +249,10 @@ async def sync_opportunity_sheet(opportunity_id: str, kind: str, payload: SheetS
         opportunity_id=opportunity_id, kind=kind,
         confirm=payload.confirm, force=payload.force, replace=payload.replace,
     )
+
+
+@router.post("/opportunities/{opportunity_id}/mark-not-selected")
+async def bulk_mark_not_selected(opportunity_id: str) -> dict:
+    """Mark all candidates who completed interviews for this opening (and have no final result) as REJECTED."""
+    return await bulk_reject_interviewed(opportunity_id)
+

@@ -1,11 +1,13 @@
+import asyncio
+from datetime import datetime, timezone
+
 from fastapi import HTTPException, status
 
-from app.db.collections import APPLICATIONS, COMPANIES, HIRING_OPPORTUNITIES, STUDENTS
+from app.db.collections import APPLICATIONS, COMPANIES, HIRING_OPPORTUNITIES, STATUS_HISTORY, STUDENTS
 from app.db.mongodb import get_database
-from app.models.application import is_real_application, status_for_api
+from app.models.application import final_status_for, is_real_application, status_for_api
 from app.utils.mongo import serialize_mongo
 from app.utils.object_id import to_object_id
-import asyncio
 
 
 def _object_id(value: str, label: str):
@@ -22,6 +24,7 @@ def _blank_counts() -> dict:
         "response_count": 0,
         "applied_count": 0,
         "shortlisted_count": 0,
+        "interview_completed_count": 0,
         "rejected_count": 0,
         "hired_count": 0,
         "not_interested_count": 0,
@@ -38,6 +41,8 @@ def _tally(counts: dict, application: dict) -> None:
     current_status = status_for_api(application)
     if current_status == "SHORTLISTED" or current_status == "shortlisted":
         counts["shortlisted_count"] += 1
+    elif current_status in {"INTERVIEW_COMPLETED", "interview_completed", "INTERVIEW_DONE", "interview_done"}:
+        counts["interview_completed_count"] += 1
     elif current_status == "REJECTED" or current_status == "rejected":
         counts["rejected_count"] += 1
     elif current_status in {"SELECTED", "JOINED", "hired"}:
@@ -155,3 +160,69 @@ async def get_admin_opportunity_detail(opportunity_id: str) -> dict:
             "applicants": applicants,
         }
     )
+
+
+async def bulk_reject_interviewed(opportunity_id: str) -> dict:
+    """Mark all candidates who completed interviews for this exact opportunity
+    (and do not already have a final result) as REJECTED.
+    """
+    db = get_database()
+    object_id = _object_id(opportunity_id, "opportunity id")
+    now = datetime.now(timezone.utc)
+
+    opportunity = await db[HIRING_OPPORTUNITIES].find_one({"_id": object_id})
+    if not opportunity:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Hiring opportunity not found"
+        )
+
+    # Match applications for this exact opportunity that reached interview completed
+    # and have not already received a final result (SELECTED, REJECTED, etc.).
+    query = {
+        "opportunity_id": object_id,
+        "$or": [
+            {"current_status": {"$in": ["INTERVIEW_COMPLETED", "interview_completed", "INTERVIEW_DONE", "interview_done"]}},
+            {
+                "current_status": {"$exists": False},
+                "status": {"$in": ["interview_completed", "interview_done"]},
+            },
+        ],
+        "final_status": {"$nin": ["HIRED", "REJECTED", "DROPPED"]},
+    }
+
+    applications = await db[APPLICATIONS].find(query).to_list(length=None)
+
+    affected = 0
+    for app in applications:
+        old_status = status_for_api(app)
+        await db[APPLICATIONS].update_one(
+            {"_id": app["_id"]},
+            {
+                "$set": {
+                    "current_status": "REJECTED",
+                    "final_status": "REJECTED",
+                    "rejected_at": now,
+                    "updated_at": now,
+                }
+            },
+        )
+        await db[STATUS_HISTORY].insert_one(
+            {
+                "application_id": app["_id"],
+                "student_id": app.get("student_id"),
+                "company_id": app.get("company_id") or opportunity.get("company_id"),
+                "opportunity_id": object_id,
+                "old_status": old_status,
+                "new_status": "REJECTED",
+                "reason": "Marked not selected after interview result confirmed",
+                "notes": None,
+                "changed_by": None,
+                "changed_by_role": "admin",
+                "source": "bulk_admin",
+                "created_at": now,
+            }
+        )
+        affected += 1
+
+    return {"marked_not_selected": affected, "opportunity_id": str(object_id)}
+
