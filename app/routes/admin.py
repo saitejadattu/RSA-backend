@@ -11,8 +11,10 @@ from app.schemas.interview_report import (
     SheetSyncRequest,
     SheetUrlRequest,
 )
+from app.schemas.admin import OpportunityDeleteRequest
 from app.schemas.student import StudentPlacementUpdate
 from app.services.admin_company_service import (
+    archive_opportunity,
     bulk_reject_interviewed,
     get_admin_company_detail,
     get_admin_opportunity_detail,
@@ -38,6 +40,7 @@ from app.services.sheet_import_service import (
     import_master_from_url,
     import_responses,
     import_shortlist,
+    auto_sync_response_and_shortlist,
     sync_from_sheet,
     update_sheet_links,
 )
@@ -85,6 +88,15 @@ async def company_detail(company_id: str) -> dict:
 @router.get("/opportunities/{opportunity_id}")
 async def opportunity_detail(opportunity_id: str) -> dict:
     return await get_admin_opportunity_detail(opportunity_id)
+
+
+@router.delete("/opportunities/{opportunity_id}")
+async def delete_opportunity(
+    opportunity_id: str,
+    payload: OpportunityDeleteRequest,
+    admin: dict = Depends(require_admin_access),
+) -> dict:
+    return await archive_opportunity(opportunity_id, admin=admin, reason=payload.reason)
 
 
 @router.get("/analytics")
@@ -237,6 +249,12 @@ async def update_opportunity_sheet_links(opportunity_id: str, payload: SheetLink
         response_url=payload.student_response_sheet,
         company_url=payload.company_sheet,
     )
+
+
+@router.post("/opportunities/{opportunity_id}/sync/responses/auto")
+async def auto_sync_response_sheet(opportunity_id: str) -> dict:
+    """Fetch and import responses, then the stored shortlist, without confirmation."""
+    return await auto_sync_response_and_shortlist(opportunity_id=opportunity_id)
 
 
 @router.post("/opportunities/{opportunity_id}/sync/{kind}")

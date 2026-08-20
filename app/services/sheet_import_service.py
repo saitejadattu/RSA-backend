@@ -14,7 +14,7 @@ import csv
 import difflib
 import io
 import re
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -696,6 +696,51 @@ async def sync_from_sheet(
     return result
 
 
+async def auto_sync_response_and_shortlist(*, opportunity_id: str) -> dict:
+    """Import responses first, then import the configured shortlist sheet."""
+    try:
+        response_result = await sync_from_sheet(
+            opportunity_id=opportunity_id,
+            kind="responses",
+            confirm=True,
+        )
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=(
+                "Response sheet import failed. "
+                "Shortlist import was not started. "
+                f"{exc.detail}"
+            ),
+        ) from exc
+
+    try:
+        shortlist_result = await sync_from_sheet(
+            opportunity_id=opportunity_id,
+            kind="shortlist",
+            confirm=True,
+            # Automatic response fetches must re-run shortlist reconciliation;
+            # an existing import stamp must not turn this step into a no-op.
+            force=True,
+        )
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=(
+                "Response sheet imported successfully, but shortlist import failed: "
+                f"{exc.detail}"
+            ),
+        ) from exc
+
+    return serialize_mongo({
+        "mode": "applied",
+        "response": response_result,
+        "shortlist": shortlist_result,
+        "counts": response_result.get("counts", {}),
+        "shortlist_counts": shortlist_result.get("counts", {}),
+    })
+
+
 async def update_sheet_links(
     *, opportunity_id: str, response_url: str | None = None, company_url: str | None = None
 ) -> dict:
@@ -1061,9 +1106,10 @@ async def _reconcile_shortlist(db, *, opportunity, company, shortlisted_ids, now
     """Once a shortlist is imported it is authoritative for the screening stage:
     every applicant on this opening who is NOT on the sheet is set to
     NOT_SHORTLISTED (this is also how a re-import corrects a wrong earlier
-    shortlist). A backup 'waitlisted' candidate is left untouched, and interview/
-    offer stages are never pulled back. Runs only when the sheet shortlisted at
-    least one person, so an empty or failed pull can't blank a shortlist.
+    shortlist). Response-sheet waitlist remarks do not override the authoritative
+    shortlist, and interview/offer stages are never pulled back. Runs only when
+    the sheet shortlisted at least one person, so an empty or failed pull can't
+    blank a shortlist.
 
     Returns the count of applications changed (or that would be, in preview).
     """
@@ -1074,7 +1120,6 @@ async def _reconcile_shortlist(db, *, opportunity, company, shortlisted_ids, now
             "opportunity_id": opportunity["_id"],
             "current_status": {"$in": ["APPLIED", "PROFILE_SHARED", "SHORTLISTED"]},
             "student_id": {"$nin": list(shortlisted_ids)},
-            "screening.decision": {"$ne": "waitlisted"},
         }
     ).to_list(length=None)
     if not confirm:
@@ -1518,6 +1563,33 @@ def master_opportunity_fields(row: dict[str, str | None]) -> dict[str, Any]:
     }
 
 
+def is_unknown_role(role: str | None) -> bool:
+    return not (role or "").strip() or (role or "").strip().lower() == "unknown"
+
+
+async def find_existing_master_opportunity(
+    db, *, company_id, role_key: str, opportunity_key: str, opportunity_received_at: datetime | None
+) -> dict | None:
+    """Find an exact opportunity, or upgrade an unknown role on the same date."""
+    exact = await db[HIRING_OPPORTUNITIES].find_one(
+        {"company_id": company_id, "role_key": role_key, "opportunity_key": opportunity_key},
+        {"_id": 1, "role": 1, "student_response_sheet": 1, "company_sheet": 1},
+    )
+    if exact or not opportunity_received_at or is_unknown_role(role_key):
+        return exact
+
+    start = opportunity_received_at.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    return await db[HIRING_OPPORTUNITIES].find_one(
+        {
+            "company_id": company_id,
+            "opportunity_received_at": {"$gte": start, "$lt": end},
+            "role_key": {"$in": ["", "unknown", None]},
+        },
+        {"_id": 1, "role": 1, "student_response_sheet": 1, "company_sheet": 1},
+    )
+
+
 async def import_master(*, raw_text: str, confirm: bool = False) -> dict:
     """Create companies and their openings from pasted master-tracker rows.
 
@@ -1591,9 +1663,12 @@ async def import_master(*, raw_text: str, confirm: bool = False) -> dict:
         opp_fields = master_opportunity_fields(row)
         existing_opportunity = None
         if existing_company:
-            existing_opportunity = await db[HIRING_OPPORTUNITIES].find_one(
-                {"company_id": existing_company["_id"], "role_key": role_key, "opportunity_key": opportunity_key},
-                {"student_response_sheet": 1, "company_sheet": 1},
+            existing_opportunity = await find_existing_master_opportunity(
+                db,
+                company_id=existing_company["_id"],
+                role_key=role_key,
+                opportunity_key=opportunity_key,
+                opportunity_received_at=opportunity_received_at,
             )
         entry["action"] = "update_opportunity" if existing_opportunity else "create_opportunity"
         counts["opportunities_to_update" if existing_opportunity else "opportunities_to_create"] += 1
@@ -1643,8 +1718,13 @@ async def import_master(*, raw_text: str, confirm: bool = False) -> dict:
             "updated_at": now,
             **change_stamps,
         }
+        opportunity_filter = (
+            {"_id": existing_opportunity["_id"]}
+            if existing_opportunity
+            else {"company_id": company["_id"], "role_key": role_key, "opportunity_key": opportunity_key}
+        )
         await db[HIRING_OPPORTUNITIES].update_one(
-            {"company_id": company["_id"], "role_key": role_key, "opportunity_key": opportunity_key},
+            opportunity_filter,
             {"$set": set_fields, "$setOnInsert": {"source": "company_master_paste", "created_at": now}},
             upsert=True,
         )

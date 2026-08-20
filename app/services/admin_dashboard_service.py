@@ -96,6 +96,7 @@ async def get_admin_dashboard() -> dict:
 
     recent_apps_task = list_recent_applications(limit=8)
     opportunity_pipeline = [
+        {"$match": {"deleted_at": {"$exists": False}}},
         {
             "$lookup": {
                 "from": APPLICATIONS,

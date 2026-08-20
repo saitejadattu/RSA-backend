@@ -58,7 +58,9 @@ async def get_admin_company_detail(company_id: str) -> dict:
     # round trips to a remote Atlas.
     company, opportunities, applications = await asyncio.gather(
         db[COMPANIES].find_one({"_id": object_id}),
-        db[HIRING_OPPORTUNITIES].find({"company_id": object_id}).sort("opportunity_received_at", -1).to_list(length=None),
+        db[HIRING_OPPORTUNITIES].find(
+            {"company_id": object_id, "deleted_at": {"$exists": False}}
+        ).sort("opportunity_received_at", -1).to_list(length=None),
         db[APPLICATIONS].find({"company_id": object_id}).to_list(length=None),
     )
     if not company:
@@ -139,7 +141,7 @@ async def get_admin_opportunity_detail(opportunity_id: str) -> dict:
     # Opportunity + its applicants are both keyed by the opportunity id — fetch
     # together; the company then needs the opportunity's company_id.
     opportunity, applicants = await asyncio.gather(
-        db[HIRING_OPPORTUNITIES].find_one({"_id": object_id}),
+        db[HIRING_OPPORTUNITIES].find_one({"_id": object_id, "deleted_at": {"$exists": False}}),
         db[APPLICATIONS].aggregate(pipeline).to_list(length=None),
     )
     if not opportunity:
@@ -160,6 +162,47 @@ async def get_admin_opportunity_detail(opportunity_id: str) -> dict:
             "applicants": applicants,
         }
     )
+
+
+async def archive_opportunity(opportunity_id: str, *, admin: dict, reason: str) -> dict:
+    """Soft-delete an opportunity while retaining related records and audit data."""
+    db = get_database()
+    object_id = _object_id(opportunity_id, "opportunity id")
+    opportunity = await db[HIRING_OPPORTUNITIES].find_one(
+        {"_id": object_id, "deleted_at": {"$exists": False}},
+        {"_id": 1, "company_id": 1, "role": 1},
+    )
+    if not opportunity:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hiring opportunity not found")
+
+    normalized_reason = reason.strip()
+    if not normalized_reason:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Deletion reason is required")
+
+    deleted_at = datetime.now(timezone.utc)
+    deleted_by = {
+        "id": admin.get("sub"),
+        "name": admin.get("name"),
+        "email": admin.get("email"),
+    }
+    await db[HIRING_OPPORTUNITIES].update_one(
+        {"_id": object_id, "deleted_at": {"$exists": False}},
+        {
+            "$set": {
+                "deleted_at": deleted_at,
+                "deleted_by": deleted_by,
+                "deletion_reason": normalized_reason,
+                "updated_at": deleted_at,
+            }
+        },
+    )
+    return serialize_mongo({
+        "archived": True,
+        "opportunity_id": object_id,
+        "deleted_at": deleted_at,
+        "deleted_by": deleted_by,
+        "deletion_reason": normalized_reason,
+    })
 
 
 async def bulk_reject_interviewed(opportunity_id: str) -> dict:
