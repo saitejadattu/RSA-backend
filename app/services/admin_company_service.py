@@ -117,9 +117,12 @@ async def get_admin_opportunity_detail(opportunity_id: str) -> dict:
                 "current_status": 1,
                 "final_status": 1,
                 "status": {"$ifNull": ["$current_status", "$status"]},
+                "student_id": 1,
                 "is_interested": {"$ifNull": ["$application_details.interested", "$is_interested"]},
                 "applied_at": 1,
                 "application_details": 1,
+                "shortlist": 1,
+                "screening": 1,
                 "github_link": {"$ifNull": ["$application_details.github_link", "$github_link"]},
                 "project_link": {"$ifNull": ["$application_details.project_link", "$project_link"]},
                 "resume_link": {"$ifNull": ["$application_details.submitted_resume_url", "$resume_link"]},
@@ -153,6 +156,7 @@ async def get_admin_opportunity_detail(opportunity_id: str) -> dict:
     counts = _blank_counts()
     for application in applicants:
         _tally(counts, application)
+    counts["shortlisted_count"] = opportunity.get("shortlists_count", 0) or 0
 
     return serialize_mongo(
         {

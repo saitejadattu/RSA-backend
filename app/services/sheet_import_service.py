@@ -1280,10 +1280,14 @@ async def _import_company_decisions(
         shortlisted_ids=shortlisted_ids, now=now, confirm=confirm,
     )
 
-    if confirm and (counts["shortlisted"] or counts["not_shortlisted"] or counts["selected_elsewhere"]):
+    if confirm:
         await db[HIRING_OPPORTUNITIES].update_one(
             {"_id": opportunity["_id"]},
-            {"$set": {"shortlist_imported_at": now, "shortlist_row_count": counts["rows"]}},
+            {"$set": {
+                "shortlist_imported_at": now,
+                "shortlist_row_count": counts["rows"],
+                "shortlists_count": len(shortlisted_ids),
+            }},
         )
 
     return serialize_mongo({
@@ -1448,10 +1452,14 @@ async def import_shortlist(*, opportunity_id: str, raw_text: str, confirm: bool 
         shortlisted_ids=shortlisted_ids, now=now, confirm=confirm,
     )
 
-    if confirm and counts["applications_to_mark"]:
+    if confirm:
         await db[HIRING_OPPORTUNITIES].update_one(
             {"_id": opportunity["_id"]},
-            {"$set": {"shortlist_imported_at": now, "shortlist_row_count": counts["rows"]}},
+            {"$set": {
+                "shortlist_imported_at": now,
+                "shortlist_row_count": counts["rows"],
+                "shortlists_count": len(shortlisted_ids),
+            }},
         )
 
     return serialize_mongo({

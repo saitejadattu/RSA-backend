@@ -150,20 +150,7 @@ async def get_admin_dashboard() -> dict:
                         }
                     }
                 },
-                "shortlisted_count": {
-                    "$size": {
-                        "$filter": {
-                            "input": "$applications",
-                            "as": "application",
-                            "cond": {
-                                "$in": [
-                                    {"$ifNull": ["$$application.current_status", "$$application.status"]},
-                                    ["SHORTLISTED", "shortlisted"],
-                                ]
-                            },
-                        }
-                    }
-                },
+                "shortlists_count": {"$ifNull": ["$shortlists_count", 0]},
             }
         },
         {"$sort": {"opportunity_received_at": -1, "updated_at": -1}},
