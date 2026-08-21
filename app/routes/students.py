@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from app.schemas.student import StudentCreate, StudentImportRequest, StudentImportResponse, StudentIssueCreate, StudentResponse
 from app.services.interview_report_service import (
@@ -7,7 +7,7 @@ from app.services.interview_report_service import (
     student_practice_questions,
 )
 from app.services.student_dashboard_service import get_student_dashboard, list_student_applications
-from app.services.student_issue_service import create_student_issue
+from app.services.student_issue_service import create_student_issue, get_student_issue, list_student_issues, reopen_student_issue
 from app.services.student_service import create_student, import_students_from_sheet, list_students_for_debug
 from app.utils.dependencies import get_current_student, require_admin_sync_token
 from app.utils.object_id import serialize_document
@@ -32,6 +32,33 @@ async def create_my_issue(
     current_student: dict = Depends(get_current_student),
 ) -> dict:
     return await create_student_issue(current_student, payload)
+
+
+@router.get("/me/issues")
+async def get_my_issues(current_student: dict = Depends(get_current_student)) -> list[dict]:
+    return await list_student_issues(current_student)
+
+
+@router.get("/me/issues/{issue_id}")
+async def get_my_issue(issue_id: str, current_student: dict = Depends(get_current_student)) -> dict:
+    try:
+        issue = await get_student_issue(current_student, issue_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    if not issue:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
+    return issue
+
+
+@router.post("/me/issues/{issue_id}/reopen")
+async def reopen_my_issue(issue_id: str, current_student: dict = Depends(get_current_student)) -> dict:
+    try:
+        issue = await reopen_student_issue(current_student, issue_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)) from exc
+    if not issue:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
+    return issue
 
 
 @router.get("/me/reports")

@@ -23,11 +23,21 @@ def _admin_audit_identity(admin: dict) -> dict:
     return {"id": admin_id, "name": admin.get("name"), "email": admin.get("email")}
 
 
-async def list_admin_issues(*, page: int = 1, limit: int = 50) -> dict:
+async def list_admin_issues(
+    *, page: int = 1, limit: int = 50, issue_status: str | None = None,
+    category: str | None = None, sort: str = "newest"
+) -> dict:
     db = get_database()
     skip = (page - 1) * limit
-    issues = await db[STUDENT_ISSUES].find({}).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
-    total = await db[STUDENT_ISSUES].count_documents({})
+    query = {}
+    if issue_status in {"IN_PROGRESS", "CLOSED"}:
+        query["status"] = {"$in": ["OPEN", "IN_PROGRESS"] if issue_status == "IN_PROGRESS" else ["RESOLVED", "CLOSED"]}
+    if category:
+        query["category"] = category
+    sort_field = "updated_at" if sort == "updated" else "created_at"
+    sort_direction = 1 if sort == "oldest" else -1
+    issues = await db[STUDENT_ISSUES].find(query).sort(sort_field, sort_direction).skip(skip).limit(limit).to_list(length=limit)
+    total = await db[STUDENT_ISSUES].count_documents(query)
     in_progress_count = await db[STUDENT_ISSUES].count_documents({"status": {"$in": ["OPEN", "IN_PROGRESS"]}})
     closed_count = await db[STUDENT_ISSUES].count_documents({"status": {"$in": ["RESOLVED", "CLOSED"]}})
 

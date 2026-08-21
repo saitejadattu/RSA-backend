@@ -79,8 +79,11 @@ async def student_detail(student_id: str) -> dict:
 async def issues(
     page: int = Query(default=1, ge=1),
     limit: int = Query(default=50, ge=1, le=100),
+    issue_status: str | None = Query(default=None, alias="status"),
+    category: str | None = Query(default=None),
+    sort: str = Query(default="newest"),
 ) -> dict:
-    return await list_admin_issues(page=page, limit=limit)
+    return await list_admin_issues(page=page, limit=limit, issue_status=issue_status, category=category, sort=sort)
 
 
 @router.get("/issues/{issue_id}")
