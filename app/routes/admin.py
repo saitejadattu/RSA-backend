@@ -11,7 +11,7 @@ from app.schemas.interview_report import (
     SheetSyncRequest,
     SheetUrlRequest,
 )
-from app.schemas.admin import OpportunityDeleteRequest
+from app.schemas.admin import OpportunityDeleteRequest, StudentIssueStatusUpdate
 from app.schemas.student import StudentPlacementUpdate
 from app.services.admin_company_service import (
     archive_opportunity,
@@ -34,7 +34,7 @@ from app.services.admin_dashboard_service import (
     resolve_student_report_ids,
     update_student_placement,
 )
-from app.services.admin_issue_service import get_admin_issue, list_admin_issues
+from app.services.admin_issue_service import get_admin_issue, list_admin_issues, update_admin_issue_status
 from app.services.interview_report_service import list_questions, question_bank, set_report_visibility
 from app.services.sheet_import_service import (
     import_master,
@@ -86,6 +86,15 @@ async def issues(
 @router.get("/issues/{issue_id}")
 async def issue_detail(issue_id: str) -> dict:
     return await get_admin_issue(issue_id)
+
+
+@router.patch("/issues/{issue_id}/status")
+async def update_issue_status(
+    issue_id: str,
+    payload: StudentIssueStatusUpdate,
+    admin: dict = Depends(require_admin_access),
+) -> dict:
+    return await update_admin_issue_status(issue_id, payload.status, admin)
 
 
 @router.patch("/students/{student_id}/placement")

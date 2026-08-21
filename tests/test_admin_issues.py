@@ -36,10 +36,21 @@ class Collection:
     async def count_documents(self, query):
         if query == {}:
             return len(self.documents)
-        return sum(1 for doc in self.documents if all(doc.get(key) == value for key, value in query.items()))
+        def matches(doc):
+            return all(
+                doc.get(key) in value.get("$in", []) if isinstance(value, dict) and "$in" in value else doc.get(key) == value
+                for key, value in query.items()
+            )
+        return sum(1 for doc in self.documents if matches(doc))
 
     async def find_one(self, query, projection=None):
         return next((doc for doc in self.documents if doc.get("_id") == query.get("_id")), None)
+
+    async def update_one(self, query, update):
+        document = await self.find_one(query)
+        if document:
+            document.update(update.get("$set", {}))
+        return document
 
 
 class Database:
@@ -65,7 +76,7 @@ async def test_admin_issue_list_returns_summary_and_student(monkeypatch):
 
     result = await admin_issue_service.list_admin_issues()
 
-    assert result["summary"] == {"total": 2, "open": 1, "resolved": 1}
+    assert result["summary"] == {"total": 2, "in_progress": 1, "closed": 1}
     assert result["items"][0]["student"]["name"] == "A Student"
 
 
@@ -80,3 +91,30 @@ async def test_admin_issue_detail_returns_description_and_student(monkeypatch):
 
     assert result["description"] == "Pending"
     assert result["student"]["phone"] == "123456"
+
+
+@pytest.mark.asyncio
+async def test_admin_issue_status_update_records_audit_and_resolved_at(monkeypatch):
+    issue_id = ObjectId()
+    issue = {"_id": issue_id, "student_id": ObjectId(), "status": "OPEN"}
+    database = Database([issue], [])
+    monkeypatch.setattr(admin_issue_service, "get_database", lambda: database)
+
+    result = await admin_issue_service.update_admin_issue_status(
+        str(issue_id),
+        "CLOSED",
+        {"sub": str(ObjectId()), "name": "Admin One", "email": "admin@example.com"},
+    )
+
+    assert result["status"] == "CLOSED"
+    assert result["updated_by"]["name"] == "Admin One"
+    assert result["updated_by"]["email"] == "admin@example.com"
+    assert result["resolved_at"] is not None
+    assert result["updated_at"] is not None
+
+    result = await admin_issue_service.update_admin_issue_status(
+        str(issue_id), "IN_PROGRESS", {"sub": str(ObjectId()), "name": "Admin Two", "email": "two@example.com"}
+    )
+    assert result["status"] == "IN_PROGRESS"
+    assert result["resolved_at"] is None
+    assert result["updated_by"]["name"] == "Admin Two"
