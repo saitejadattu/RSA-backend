@@ -1,12 +1,13 @@
 from fastapi import APIRouter, Depends, Query
 
-from app.schemas.student import StudentCreate, StudentImportRequest, StudentImportResponse, StudentResponse
+from app.schemas.student import StudentCreate, StudentImportRequest, StudentImportResponse, StudentIssueCreate, StudentResponse
 from app.services.interview_report_service import (
     company_interview_insights,
     list_student_reports,
     student_practice_questions,
 )
 from app.services.student_dashboard_service import get_student_dashboard, list_student_applications
+from app.services.student_issue_service import create_student_issue
 from app.services.student_service import create_student, import_students_from_sheet, list_students_for_debug
 from app.utils.dependencies import get_current_student, require_admin_sync_token
 from app.utils.object_id import serialize_document
@@ -23,6 +24,14 @@ async def get_my_dashboard(current_student: dict = Depends(get_current_student))
 @router.get("/me/applications")
 async def get_my_applications(current_student: dict = Depends(get_current_student)) -> list[dict]:
     return await list_student_applications(current_student)
+
+
+@router.post("/me/issues")
+async def create_my_issue(
+    payload: StudentIssueCreate,
+    current_student: dict = Depends(get_current_student),
+) -> dict:
+    return await create_student_issue(current_student, payload)
 
 
 @router.get("/me/reports")

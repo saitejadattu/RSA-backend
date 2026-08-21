@@ -1,5 +1,6 @@
 ADMINS = "admins"
 STUDENTS = "students"
+STUDENT_ISSUES = "student_issues"
 TRANSCRIPTS = "transcripts"
 INTERVIEW_SESSIONS = "interview_sessions"
 INTERVIEW_REPORTS = "interview_reports"

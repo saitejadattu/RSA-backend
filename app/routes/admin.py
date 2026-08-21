@@ -34,6 +34,7 @@ from app.services.admin_dashboard_service import (
     resolve_student_report_ids,
     update_student_placement,
 )
+from app.services.admin_issue_service import get_admin_issue, list_admin_issues
 from app.services.interview_report_service import list_questions, question_bank, set_report_visibility
 from app.services.sheet_import_service import (
     import_master,
@@ -72,6 +73,19 @@ async def students(limit: int = Query(default=500, ge=1, le=1000)) -> list[dict]
 async def student_detail(student_id: str) -> dict:
     """Full profile for one student: info, pipeline stats, applications, role mix, reports."""
     return await get_admin_student_detail(student_id)
+
+
+@router.get("/issues")
+async def issues(
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=50, ge=1, le=100),
+) -> dict:
+    return await list_admin_issues(page=page, limit=limit)
+
+
+@router.get("/issues/{issue_id}")
+async def issue_detail(issue_id: str) -> dict:
+    return await get_admin_issue(issue_id)
 
 
 @router.patch("/students/{student_id}/placement")

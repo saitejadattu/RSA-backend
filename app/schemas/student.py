@@ -1,6 +1,8 @@
 from datetime import datetime
 
-from pydantic import BaseModel, EmailStr, Field
+from typing import Literal
+
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 class StudentResponse(BaseModel):
@@ -40,3 +42,17 @@ class StudentPlacementUpdate(BaseModel):
     """Placement outcome set by an administrator."""
 
     placed_status: bool
+
+
+class StudentIssueCreate(BaseModel):
+    title: str = Field(..., min_length=1, max_length=200)
+    description: str = Field(..., min_length=1, max_length=5000)
+    category: Literal["BUG", "APPLICATION", "INTERVIEW", "FEEDBACK", "OTHER"]
+
+    @field_validator("title", "description")
+    @classmethod
+    def reject_blank_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("must not be blank")
+        return value
