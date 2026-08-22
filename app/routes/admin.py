@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import StreamingResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse, StreamingResponse
 from io import BytesIO
 
 from app.schemas.interview_report import (
@@ -11,7 +12,7 @@ from app.schemas.interview_report import (
     SheetSyncRequest,
     SheetUrlRequest,
 )
-from app.schemas.admin import OpportunityDeleteRequest, StudentIssueStatusUpdate
+from app.schemas.admin import MasterIncrementalRequest, OpportunityDeleteRequest, StudentIssueStatusUpdate
 from app.schemas.student import StudentPlacementUpdate
 from app.services.admin_company_service import (
     archive_opportunity,
@@ -39,12 +40,16 @@ from app.services.interview_report_service import list_questions, question_bank,
 from app.services.sheet_import_service import (
     import_master,
     import_master_from_url,
+    import_master_incremental_from_url,
     import_responses,
     import_shortlist,
     auto_sync_response_and_shortlist,
+    sync_shortlist_sheet_incremental,
     sync_from_sheet,
+    sync_response_sheet_incremental,
     update_sheet_links,
 )
+from app.jobs.incremental_sync import run_incremental_sync
 from app.utils.dependencies import require_admin_access
 
 
@@ -245,6 +250,12 @@ async def fetch_company_master_sheet(payload: SheetUrlRequest) -> dict:
     return await import_master_from_url(url=payload.url, confirm=payload.confirm)
 
 
+@router.post("/companies/import/incremental")
+async def fetch_company_master_incremental(payload: MasterIncrementalRequest) -> dict:
+    """Fetch only master rows after the stored source-row watermark."""
+    return await import_master_incremental_from_url(url=payload.url)
+
+
 @router.post("/opportunities/{opportunity_id}/import/responses")
 async def import_response_sheet(opportunity_id: str, payload: SheetPasteRequest) -> dict:
     """Paste a response sheet for this opening.
@@ -281,6 +292,27 @@ async def update_opportunity_sheet_links(opportunity_id: str, payload: SheetLink
 async def auto_sync_response_sheet(opportunity_id: str) -> dict:
     """Fetch and import responses, then the stored shortlist, without confirmation."""
     return await auto_sync_response_and_shortlist(opportunity_id=opportunity_id)
+
+
+@router.post("/opportunities/{opportunity_id}/sync/responses/incremental")
+async def incremental_sync_response_sheet(opportunity_id: str) -> dict:
+    """Fetch only new response rows after the saved row watermark."""
+    return await sync_response_sheet_incremental(opportunity_id=opportunity_id)
+
+
+@router.post("/opportunities/{opportunity_id}/sync/shortlist/incremental")
+async def incremental_sync_shortlist_sheet(opportunity_id: str) -> dict:
+    """Fetch only new UUID-backed shortlist rows after the saved checkpoint."""
+    return await sync_shortlist_sheet_incremental(opportunity_id=opportunity_id)
+
+
+@router.post("/sync/incremental")
+async def manual_incremental_sync(payload: MasterIncrementalRequest | None = None) -> dict:
+    """Run the Phase 4 incremental pipeline from an authenticated admin UI."""
+    result = await run_incremental_sync(master_url=payload.url if payload else None)
+    if result.get("status") == "FAILED":
+        return JSONResponse(status_code=status.HTTP_502_BAD_GATEWAY, content=jsonable_encoder(result))
+    return result
 
 
 @router.post("/opportunities/{opportunity_id}/sync/{kind}")

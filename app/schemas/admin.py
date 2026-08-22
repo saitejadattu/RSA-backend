@@ -9,3 +9,7 @@ class OpportunityDeleteRequest(BaseModel):
 
 class StudentIssueStatusUpdate(BaseModel):
     status: Literal["IN_PROGRESS", "CLOSED"]
+
+
+class MasterIncrementalRequest(BaseModel):
+    url: str = Field(..., min_length=1, description="A public Google Sheets master tracker URL.")

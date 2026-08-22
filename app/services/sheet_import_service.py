@@ -638,6 +638,215 @@ async def fetch_sheet_text(url: str | None) -> str:
     return response.text
 
 
+async def fetch_master_incremental_text(url: str, start_row: int, end_row: int | None = None) -> str:
+    """Fetch the master header and a bounded data-row range."""
+    export = sheet_export_url(url)
+    if not export:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Master incremental sync failed: that doesn't look like a Google Sheets link.",
+        )
+    document = SHEET_ID_RE.search(url)
+    gid_match = SHEET_GID_RE.search(url)
+    if not document:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid master sheet URL")
+    gviz = f"https://docs.google.com/spreadsheets/d/{document.group(1)}/gviz/tq"
+    params = {"tqx": "out:csv", "gid": gid_match.group(1) if gid_match else "0"}
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            header_response = await client.get(gviz, params={**params, "range": "A1:ZZ1"})
+            requested_range = f"A{start_row}:ZZ{end_row}" if end_row else f"A{start_row}:ZZ"
+            rows_response = await client.get(gviz, params={**params, "range": requested_range})
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Master incremental sync failed: {exc}") from exc
+
+    for response in (header_response, rows_response):
+        content_type = response.headers.get("content-type", "").lower()
+        if response.status_code != 200 or "html" in content_type:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Master incremental sync failed: the sheet is not publicly accessible.",
+            )
+    if not header_response.text.strip():
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Master incremental sync failed: header row is empty.")
+    return f"{header_response.text.rstrip(chr(10))}\n{rows_response.text.lstrip(chr(10))}" if rows_response.text.strip() else header_response.text
+
+
+async def fetch_response_incremental_text(url: str, start_row: int) -> str:
+    """Fetch the response header and only rows after the saved source-row watermark."""
+    export = sheet_export_url(url)
+    if not export:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Response incremental sync failed: that doesn't look like a Google Sheets link.",
+        )
+    document = SHEET_ID_RE.search(url)
+    gid_match = SHEET_GID_RE.search(url)
+    if not document:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid response sheet URL")
+    gviz = f"https://docs.google.com/spreadsheets/d/{document.group(1)}/gviz/tq"
+    params = {"tqx": "out:tsv", "gid": gid_match.group(1) if gid_match else "0"}
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+            header_response = await client.get(gviz, params={**params, "range": "A1:ZZ1"})
+            rows_response = await client.get(gviz, params={**params, "range": f"A{start_row}:ZZ"})
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Response incremental sync failed: {exc}") from exc
+
+    for response in (header_response, rows_response):
+        content_type = response.headers.get("content-type", "").lower()
+        if response.status_code != 200 or "html" in content_type:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Response incremental sync failed: the sheet is not publicly accessible.",
+            )
+    if not header_response.text.strip():
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Response incremental sync failed: header row is empty.")
+    if not rows_response.text.strip():
+        return header_response.text
+    return f"{header_response.text.rstrip(chr(10))}\n{rows_response.text.lstrip(chr(10))}"
+
+
+def _response_checkpoint(row: dict[str, str | None], row_index: int) -> tuple[datetime | None, int, str | None]:
+    """Return (timestamp, source_row, uid) for a response row.
+
+    The Google Forms timestamp is the safest per-response marker available in the
+    sheet data. We keep the row number as a tie-breaker only when multiple rows
+    share the exact same timestamp, which prevents a timestamp-only cursor from
+    skipping records.
+    """
+    ts_value = pick(row, "Timestamp", "Creation Datetime", "Submitted At")
+    ts = parse_timestamp(ts_value)
+    uid = pick(row, "Student UID", "student_uid", "uid", "User ID")
+    return ts, row_index, uid
+
+
+def _rebuild_raw_text(headers: list[str], rows: list[dict[str, str | None]]) -> str:
+    if not headers or not rows:
+        return ""
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=headers, delimiter="\t", lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({header: row.get(header, "") for header in headers})
+    return output.getvalue()
+
+
+async def sync_response_sheet_incremental(*, opportunity_id: str) -> dict:
+    """Process only response rows newer than the opportunity's saved checkpoint.
+
+    The response sheet exposes a Google Forms Timestamp column, which is a safer
+    per-response cursor than a raw row number. We still keep the last processed
+    source row as a tie-breaker when two submissions share the same timestamp.
+    """
+    db = get_database()
+    opportunity, _ = await load_opportunity(db, opportunity_id)
+    url = (opportunity.get("student_response_sheet") or "").strip()
+    if not url:
+        return serialize_mongo({
+            "mode": "incremental",
+            "opportunity_id": opportunity_id,
+            "rows_scanned": 0,
+            "rows_processed": 0,
+            "applications_created": 0,
+            "applications_updated": 0,
+            "skipped": 0,
+            "message": "No response sheet URL is stored for this opportunity.",
+        })
+
+    response_sync = opportunity.get("response_sync") or {}
+    last_timestamp = response_sync.get("last_processed_response_timestamp")
+    last_row = response_sync.get("last_processed_row")
+    if not last_timestamp and last_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Response incremental sync failed: run the manual full response import first to establish the response checkpoint.",
+        )
+
+    raw_text = await fetch_sheet_text(url)
+    all_rows = read_response_rows(raw_text)
+    if not all_rows:
+        return serialize_mongo({
+            "mode": "incremental",
+            "opportunity_id": opportunity_id,
+            "rows_scanned": 0,
+            "rows_processed": 0,
+            "applications_created": 0,
+            "applications_updated": 0,
+            "skipped": 0,
+            "last_processed_response_timestamp": last_timestamp,
+            "last_processed_row": last_row,
+            "message": "No new response rows were found after the saved checkpoint.",
+        })
+
+    headers = list(all_rows[0].keys())
+    new_rows: list[dict[str, str | None]] = []
+    latest_seen: tuple[datetime | None, int, str | None] | None = None
+    for raw_index, row in enumerate(all_rows, start=2):
+        candidate_ts, candidate_row, candidate_uid = _response_checkpoint(row, raw_index)
+        if not candidate_ts:
+            continue
+        if last_timestamp:
+            last_dt = parse_timestamp(last_timestamp)
+            if candidate_ts < (last_dt or candidate_ts):
+                continue
+            if candidate_ts == last_dt:
+                if last_row is not None and candidate_row <= int(last_row):
+                    continue
+        elif last_row is not None and candidate_row <= int(last_row):
+            continue
+        new_rows.append(row)
+        latest_seen = (candidate_ts, candidate_row, candidate_uid)
+
+    if not new_rows:
+        return serialize_mongo({
+            "mode": "incremental",
+            "opportunity_id": opportunity_id,
+            "rows_scanned": len(all_rows),
+            "rows_processed": 0,
+            "applications_created": 0,
+            "applications_updated": 0,
+            "skipped": len(all_rows),
+            "last_processed_response_timestamp": last_timestamp,
+            "last_processed_row": last_row,
+            "message": "No new response rows were found after the saved checkpoint.",
+        })
+
+    result = await import_responses(
+        opportunity_id=opportunity_id,
+        raw_text=_rebuild_raw_text(headers, new_rows),
+        confirm=True,
+        replace=False,
+    )
+    counts = result.get("counts", {})
+    if latest_seen is None:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Response sync checkpoint could not be advanced.")
+    latest_ts, latest_row, _ = latest_seen
+    now = datetime.now(timezone.utc)
+    next_sync = {
+        **response_sync,
+        "last_processed_response_timestamp": latest_ts.isoformat().replace("+00:00", "Z") if latest_ts else None,
+        "last_processed_row": int(latest_row),
+        "last_processed_at": now,
+        "last_successful_sync_at": now,
+    }
+    await db[HIRING_OPPORTUNITIES].update_one({"_id": opportunity["_id"]}, {"$set": {"response_sync": next_sync}})
+
+    return serialize_mongo({
+        "mode": "incremental",
+        "opportunity_id": opportunity_id,
+        "rows_scanned": len(new_rows),
+        "rows_processed": counts.get("applications_to_create", 0) + counts.get("applications_to_update", 0),
+        "applications_created": counts.get("applications_to_create", 0),
+        "applications_updated": counts.get("applications_to_update", 0),
+        "skipped": counts.get("skipped", 0),
+        "last_processed_response_timestamp": next_sync["last_processed_response_timestamp"],
+        "last_processed_row": int(latest_row),
+        "source_url": url,
+        "result": result,
+    })
+
+
 async def sync_from_sheet(
     *, opportunity_id: str, kind: str, confirm: bool = False, force: bool = False, replace: bool = False
 ) -> dict:
@@ -1154,7 +1363,8 @@ async def _reconcile_shortlist(db, *, opportunity, company, shortlisted_ids, now
 
 
 async def _import_company_decisions(
-    *, opportunity_id: str, rows: list[dict[str, str | None]], field_map: dict[str, str | None], confirm: bool
+    *, opportunity_id: str, rows: list[dict[str, str | None]], field_map: dict[str, str | None], confirm: bool,
+    reconcile: bool = True, update_opportunity: bool = True,
 ) -> dict:
     """Header-based company sheet: apply each candidate's remark decision and
     store the remark so the candidate can see why they weren't shortlisted.
@@ -1170,6 +1380,7 @@ async def _import_company_decisions(
 
     preview: list[dict[str, Any]] = []
     shortlisted_ids: set = set()
+    source_record_ids: set[str] = set()
     counts = {
         "rows": len(rows),
         "students_matched": 0,
@@ -1185,6 +1396,8 @@ async def _import_company_decisions(
 
     for index, row in enumerate(rows, start=1):
         identity = extract_identity(row, field_map)
+        if identity.get("uid"):
+            source_record_ids.add(identity["uid"])
         remark = (row.get(remark_header) or "").strip() if remark_header else ""
         decision, target = classify_remark(remark)
         # The company sheet IS the shortlist: a listed candidate with no explicit
@@ -1275,18 +1488,21 @@ async def _import_company_decisions(
             })
         preview.append(entry)
 
-    counts["removed_from_shortlist"] = await _reconcile_shortlist(
-        db, opportunity=opportunity, company=company,
-        shortlisted_ids=shortlisted_ids, now=now, confirm=confirm,
-    )
+    if reconcile:
+        counts["removed_from_shortlist"] = await _reconcile_shortlist(
+            db, opportunity=opportunity, company=company,
+            shortlisted_ids=shortlisted_ids, now=now, confirm=confirm,
+        )
 
-    if confirm:
+    if confirm and update_opportunity:
         await db[HIRING_OPPORTUNITIES].update_one(
             {"_id": opportunity["_id"]},
             {"$set": {
                 "shortlist_imported_at": now,
                 "shortlist_row_count": counts["rows"],
                 "shortlists_count": len(shortlisted_ids),
+                "shortlist_sync.shortlisted_student_ids": list(shortlisted_ids),
+                "shortlist_sync.source_record_ids": sorted(source_record_ids),
             }},
         )
 
@@ -1300,7 +1516,10 @@ async def _import_company_decisions(
     })
 
 
-async def import_shortlist(*, opportunity_id: str, raw_text: str, confirm: bool = False) -> dict:
+async def import_shortlist(
+    *, opportunity_id: str, raw_text: str, confirm: bool = False,
+    reconcile: bool = True, update_opportunity: bool = True,
+) -> dict:
     # A modern company sheet has a proper header row and a per-candidate remarks
     # column; route those to the decision-based importer. Old positional sheets
     # (no reliable header) fall through to the legacy path below.
@@ -1309,7 +1528,8 @@ async def import_shortlist(*, opportunity_id: str, raw_text: str, confirm: bool 
         field_map = build_field_map(list(header_rows[0].keys()))
         if field_map["uid"] or field_map["email"] or field_map["phone"] or field_map["name"]:
             return await _import_company_decisions(
-                opportunity_id=opportunity_id, rows=header_rows, field_map=field_map, confirm=confirm
+                opportunity_id=opportunity_id, rows=header_rows, field_map=field_map, confirm=confirm,
+                reconcile=reconcile, update_opportunity=update_opportunity,
             )
 
     db = get_database()
@@ -1339,11 +1559,14 @@ async def import_shortlist(*, opportunity_id: str, raw_text: str, confirm: bool 
     }
     willing = {"interested": 0, "not_interested": 0, "no_response": 0}
     shortlisted_ids: set = set()
+    source_record_ids: set[str] = set()
 
     applicants = await build_applicant_index(db, opportunity["_id"])
 
     for index, cells in enumerate(rows, start=1):
         data = extract_shortlist_row(cells)
+        if data.get("uid"):
+            source_record_ids.add(data["uid"])
         willing[data["willing_to_join"] or "no_response"] += 1
         entry: dict[str, Any] = {
             "row": index,
@@ -1447,18 +1670,21 @@ async def import_shortlist(*, opportunity_id: str, raw_text: str, confirm: bool 
             })
         preview.append(entry)
 
-    counts["removed_from_shortlist"] = await _reconcile_shortlist(
-        db, opportunity=opportunity, company=company,
-        shortlisted_ids=shortlisted_ids, now=now, confirm=confirm,
-    )
+    if reconcile:
+        counts["removed_from_shortlist"] = await _reconcile_shortlist(
+            db, opportunity=opportunity, company=company,
+            shortlisted_ids=shortlisted_ids, now=now, confirm=confirm,
+        )
 
-    if confirm:
+    if confirm and update_opportunity:
         await db[HIRING_OPPORTUNITIES].update_one(
             {"_id": opportunity["_id"]},
             {"$set": {
                 "shortlist_imported_at": now,
                 "shortlist_row_count": counts["rows"],
                 "shortlists_count": len(shortlisted_ids),
+                "shortlist_sync.shortlisted_student_ids": list(shortlisted_ids),
+                "shortlist_sync.source_record_ids": sorted(source_record_ids),
             }},
         )
 
@@ -1469,6 +1695,125 @@ async def import_shortlist(*, opportunity_id: str, raw_text: str, confirm: bool 
         "counts": counts,
         "willing_breakdown": willing,
         "rows": preview,
+    })
+
+
+async def sync_shortlist_sheet_incremental(*, opportunity_id: str) -> dict:
+    """Import only previously unseen UUID-backed shortlist records.
+
+    Shortlist sheets have no universal submission timestamp. UUID is the only
+    stable source marker found in the supported exports. Full sync remains the
+    reconciliation path for edits, deletions, reordering, and legacy sheets.
+    """
+    db = get_database()
+    opportunity, company = await load_opportunity(db, opportunity_id)
+    url = (opportunity.get("company_sheet") or "").strip()
+    if not url:
+        return serialize_mongo({
+            "mode": "skipped",
+            "opportunity_id": opportunity_id,
+            "rows_scanned": 0,
+            "rows_processed": 0,
+            "message": "No shortlist sheet URL is stored for this opportunity.",
+        })
+
+    response_sync = opportunity.get("shortlist_sync") or {}
+    if "source_record_ids" not in response_sync or "shortlisted_student_ids" not in response_sync:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Shortlist incremental sync failed: run the manual full shortlist import first to establish the shortlist checkpoint.",
+        )
+
+    raw_text = await fetch_sheet_text(url)
+    header_rows = read_response_rows(raw_text)
+    field_map = build_field_map(list(header_rows[0].keys())) if header_rows else {}
+    is_header_source = bool(header_rows and (field_map.get("uid") or field_map.get("email") or field_map.get("phone") or field_map.get("name")))
+    if is_header_source:
+        rows = header_rows
+        source_ids = [pick(row, field_map["uid"] or "") for row in rows]
+        if any(not value or not UUID_RE.fullmatch(value) for value in source_ids):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Shortlist incremental sync requires a stable UUID in every shortlist row. Use the manual full shortlist sync for this sheet.",
+            )
+    else:
+        positional_rows = read_shortlist_rows(raw_text)
+        rows = positional_rows
+        source_ids = [extract_shortlist_row(row).get("uid") for row in rows]
+        if any(not value or not UUID_RE.fullmatch(value) for value in source_ids):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Shortlist incremental sync requires a stable UUID in every shortlist row. Use the manual full shortlist sync for this sheet.",
+            )
+
+    previous_record_ids = set(response_sync.get("source_record_ids") or [])
+    previous_student_ids = set(response_sync.get("shortlisted_student_ids") or [])
+    unseen_indexes = [index for index, source_id in enumerate(source_ids) if source_id not in previous_record_ids]
+    if not unseen_indexes:
+        return serialize_mongo({
+            "mode": "incremental",
+            "opportunity_id": opportunity_id,
+            "rows_scanned": len(rows),
+            "rows_processed": 0,
+            "shortlists_count": len(previous_student_ids),
+            "message": "No new shortlist rows were found after the saved checkpoint.",
+        })
+
+    applicants = await build_applicant_index(db, opportunity["_id"])
+    new_shortlisted_ids: set = set()
+    for index in unseen_indexes:
+        if is_header_source:
+            identity = extract_identity(rows[index], field_map)
+            remark_header = detect_remark_header(list(rows[index].keys()))
+            decision, _ = classify_remark((rows[index].get(remark_header) or "").strip() if remark_header else "")
+            is_shortlisted = decision in {"none", "shortlisted"}
+        else:
+            identity = extract_shortlist_row(rows[index])
+            is_shortlisted = True
+        student, ambiguous = match_applicant(identity, applicants)
+        if is_shortlisted and not ambiguous and student:
+            new_shortlisted_ids.add(student["_id"])
+
+    if is_header_source:
+        incremental_text = _rebuild_raw_text(list(rows[0].keys()), [rows[index] for index in unseen_indexes])
+    else:
+        incremental_text = "".join("\t".join(cell or "" for cell in rows[index]) + "\n" for index in unseen_indexes)
+    result = await import_shortlist(
+        opportunity_id=opportunity_id,
+        raw_text=incremental_text,
+        confirm=True,
+        reconcile=False,
+        update_opportunity=False,
+    )
+
+    now = datetime.now(timezone.utc)
+    next_student_ids = previous_student_ids | new_shortlisted_ids
+    await db[HIRING_OPPORTUNITIES].update_one(
+        {"_id": opportunity["_id"]},
+        {"$set": {
+            "shortlist_sync": {
+                **response_sync,
+                "shortlisted_student_ids": list(next_student_ids),
+                "source_record_ids": sorted(previous_record_ids | {
+                    source_ids[index] for index in unseen_indexes
+                }),
+                "last_processed_source_id": source_ids[unseen_indexes[-1]],
+                "last_successful_sync_at": now,
+            },
+            "shortlist_imported_at": now,
+            "shortlist_row_count": len(rows),
+            "shortlists_count": len(next_student_ids),
+        }},
+    )
+    return serialize_mongo({
+        "mode": "incremental",
+        "opportunity_id": opportunity_id,
+        "rows_scanned": len(rows),
+        "rows_processed": len(unseen_indexes),
+        "shortlists_count": len(next_student_ids),
+        "last_processed_source_id": source_ids[unseen_indexes[-1]],
+        "source_url": url,
+        "result": result,
     })
 
 
@@ -1598,7 +1943,10 @@ async def find_existing_master_opportunity(
     )
 
 
-async def import_master(*, raw_text: str, confirm: bool = False) -> dict:
+async def import_master(
+    *, raw_text: str, confirm: bool = False, source_row_offset: int = 0,
+    collect_opportunity_ids: bool = False,
+) -> dict:
     """Create companies and their openings from pasted master-tracker rows.
 
     A header row is required so columns can be matched by name. Both the company
@@ -1626,13 +1974,16 @@ async def import_master(*, raw_text: str, confirm: bool = False) -> dict:
         "skipped": 0,
     }
     seen_companies: set[str] = set()
+    opportunity_ids: list[str] = []
+    processed_opportunities: list[dict[str, Any]] = []
 
     for index, row in enumerate(rows, start=1):
         name = pick(row, "Company Name")
         role = pick(row, "Role") or "unknown"
         received_on = pick(row, "Opportunity Received On")
         received_time = pick(row, "Received Time")
-        entry: dict[str, Any] = {"row": index, "company": name, "role": role, "received_on": received_on}
+        source_sheet_row = source_row_offset + index + 1
+        entry: dict[str, Any] = {"row": index, "source_sheet_row": source_sheet_row, "company": name, "role": role, "received_on": received_on}
 
         if not name:
             entry["action"] = "skip"
@@ -1723,6 +2074,7 @@ async def import_master(*, raw_text: str, confirm: bool = False) -> dict:
             "opportunity_received_at": opportunity_received_at,
             **opp_fields,
             "raw_company_row": row,
+            "source_sheet_row": source_sheet_row,
             "updated_at": now,
             **change_stamps,
         }
@@ -1736,9 +2088,27 @@ async def import_master(*, raw_text: str, confirm: bool = False) -> dict:
             {"$set": set_fields, "$setOnInsert": {"source": "company_master_paste", "created_at": now}},
             upsert=True,
         )
+        if collect_opportunity_ids:
+            imported_opportunity = await db[HIRING_OPPORTUNITIES].find_one(opportunity_filter, {"_id": 1})
+            if imported_opportunity and imported_opportunity.get("_id") is not None:
+                opportunity_id = str(imported_opportunity["_id"])
+                opportunity_ids.append(opportunity_id)
+                processed_opportunities.append({
+                    "opportunity_id": opportunity_id,
+                    "is_new": existing_opportunity is None,
+                    "company": name,
+                    "role": role,
+                    "received_on": received_on,
+                    "response_url_present": bool(opp_fields.get("student_response_sheet")),
+                    "shortlist_url_present": bool(opp_fields.get("company_sheet")),
+                })
         preview.append(entry)
 
-    return serialize_mongo({"mode": "applied" if confirm else "preview", "counts": counts, "rows": preview})
+    result = {"mode": "applied" if confirm else "preview", "counts": counts, "rows": preview}
+    if collect_opportunity_ids:
+        result["opportunity_ids"] = list(dict.fromkeys(opportunity_ids))
+        result["processed_opportunities"] = processed_opportunities
+    return serialize_mongo(result)
 
 
 async def import_master_from_url(*, url: str, confirm: bool = False) -> dict:
@@ -1751,3 +2121,95 @@ async def import_master_from_url(*, url: str, confirm: bool = False) -> dict:
     result = await import_master(raw_text=raw_text, confirm=confirm)
     result["source_url"] = url
     return result
+
+
+async def import_master_incremental_from_url(*, url: str) -> dict:
+    """Fetch a bounded master window and import rows newer than the date checkpoint."""
+    db = get_database()
+    latest = await db[HIRING_OPPORTUNITIES].find(
+        {"opportunity_received_at": {"$type": "date"}},
+        {"opportunity_received_at": 1, "source_sheet_row": 1},
+    ).sort("opportunity_received_at", -1).limit(1).to_list(length=1)
+    if not latest or latest[0].get("opportunity_received_at") is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Incremental sync requires an existing synchronized Master dataset. Run Fetch entire sheet data first.",
+        )
+
+    latest_date = latest[0]["opportunity_received_at"]
+    if latest_date.tzinfo is None:
+        latest_date = latest_date.replace(tzinfo=timezone.utc)
+    source_hint = latest[0].get("source_sheet_row")
+    if source_hint is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Incremental sync requires a synchronized Master source position. Run Fetch entire sheet data first.",
+        )
+    window_start = max(2, int(source_hint) - 10)
+    window_end = window_start + 39
+    raw_text = await fetch_master_incremental_text(url, window_start, window_end)
+    rows = read_response_rows(raw_text)
+    candidate_rows: list[dict[str, str | None]] = []
+    for row in rows:
+        received_at = combine_date_time(pick(row, "Opportunity Received On"), pick(row, "Received Time"))
+        if not received_at or received_at < latest_date:
+            continue
+        name = pick(row, "Company Name")
+        role = pick(row, "Role") or "unknown"
+        company = await db[COMPANIES].find_one({"company_key": company_key(name)}, {"_id": 1}) if name else None
+        role_key = company_key(role)
+        opportunity_key = company_key(
+            received_at.isoformat()
+            if received_at
+            else f"{pick(row, 'Opportunity Received On') or 'no-date'}-{pick(row, 'Received Time') or 'no-time'}"
+        )
+        existing = None
+        if company:
+            existing = await find_existing_master_opportunity(
+                db,
+                company_id=company["_id"],
+                role_key=role_key,
+                opportunity_key=opportunity_key,
+                opportunity_received_at=received_at,
+            )
+        candidate_rows.append(row)
+
+    if not candidate_rows:
+        return {
+            "mode": "incremental",
+            "rows_scanned": len(rows),
+            "rows_processed": 0,
+            "opportunities_created": 0,
+            "opportunities_updated": 0,
+            "companies_created": 0,
+            "companies_updated": 0,
+            "rows_skipped": 0,
+            "errors": [],
+            "latest_opportunity_date": latest_date.isoformat(),
+            "opportunity_ids": [],
+            "processed_opportunities": [],
+            "message": "No new opportunities found in the incremental range. Use Fetch entire sheet data if you suspect older or missing rows.",
+        }
+
+    candidate_text = _rebuild_raw_text(list(rows[0].keys()), candidate_rows)
+    result = await import_master(
+        raw_text=candidate_text,
+        confirm=True,
+        source_row_offset=window_start - 2,
+        collect_opportunity_ids=True,
+    )
+    counts = result.get("counts", {})
+    return {
+        "mode": "incremental",
+        "rows_scanned": counts.get("rows", 0),
+        "rows_processed": counts.get("opportunities_to_create", 0) + counts.get("opportunities_to_update", 0),
+        "opportunities_created": counts.get("opportunities_to_create", 0),
+        "opportunities_updated": counts.get("opportunities_to_update", 0),
+        "companies_created": counts.get("companies_new", 0),
+        "companies_updated": counts.get("companies_existing", 0),
+        "rows_skipped": counts.get("skipped", 0),
+        "errors": [],
+        "latest_opportunity_date": latest_date.isoformat(),
+        "opportunity_ids": result.get("opportunity_ids", []),
+        "processed_opportunities": result.get("processed_opportunities", []),
+    }
