@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 import difflib
 import hashlib
+import logging
 import re
 from typing import Any
 
@@ -44,6 +45,10 @@ from app.services.transcript_service import (
 )
 from app.utils.mongo import serialize_mongo
 from app.utils.object_id import to_object_id
+from app.utils.user_errors import sanitize_ai_failure
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def _transcript_hash(raw_text: str) -> str:
@@ -896,7 +901,8 @@ async def analyze_session(session_id: str) -> dict:
                 context=context,
             )
         except HTTPException as exc:
-            failures.append({"speaker_label": label, "detail": str(exc.detail)})
+            LOGGER.exception("[AI ANALYSIS] Candidate analysis failed for %s", label)
+            failures.append({"speaker_label": label, "detail": sanitize_ai_failure(exc)})
             continue
 
         now = utc_now()
@@ -991,7 +997,7 @@ async def analyze_session(session_id: str) -> dict:
     if not written:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Analysis failed for every candidate: {failures}",
+            detail="AI analysis could not be completed for the selected candidates. Please try again later.",
         )
 
     # Company-level pass over the whole session (what the company looked for).
@@ -1022,6 +1028,10 @@ async def analyze_session(session_id: str) -> dict:
     return {
         "session_id": str(session_object_id),
         "status": final_status,
+        "message": (
+            "Analysis completed for some candidates, but some results could not be generated."
+            if failures else None
+        ),
         "candidates_analyzed": len(written),
         "questions_extracted": len(all_question_keys),
         "students": [block["speaker_label"] for block in blocks],
