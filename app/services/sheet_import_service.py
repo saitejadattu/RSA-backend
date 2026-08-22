@@ -38,6 +38,7 @@ from app.models.application import (
     status_for_api,
 )
 from app.models.student import build_student_document
+from app.services.opportunity_counter_service import refresh_opportunity_counts
 from app.services.student_service import normalize_email, normalize_phone
 from app.utils.mongo import serialize_mongo
 from app.utils.object_id import to_object_id
@@ -1505,6 +1506,7 @@ async def _import_company_decisions(
                 "shortlist_sync.source_record_ids": sorted(source_record_ids),
             }},
         )
+        await refresh_opportunity_counts(opportunity["_id"])
 
     return serialize_mongo({
         "mode": "applied" if confirm else "preview",
@@ -1687,6 +1689,10 @@ async def import_shortlist(
                 "shortlist_sync.source_record_ids": sorted(source_record_ids),
             }},
         )
+        await refresh_opportunity_counts(opportunity["_id"])
+
+    if confirm:
+        await refresh_opportunity_counts(opportunity["_id"])
 
     return serialize_mongo({
         "mode": "applied" if confirm else "preview",
@@ -1805,6 +1811,7 @@ async def sync_shortlist_sheet_incremental(*, opportunity_id: str) -> dict:
             "shortlists_count": len(next_student_ids),
         }},
     )
+    await refresh_opportunity_counts(opportunity["_id"])
     return serialize_mongo({
         "mode": "incremental",
         "opportunity_id": opportunity_id,

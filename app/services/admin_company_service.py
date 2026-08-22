@@ -6,6 +6,7 @@ from fastapi import HTTPException, status
 from app.db.collections import APPLICATIONS, COMPANIES, HIRING_OPPORTUNITIES, STATUS_HISTORY, STUDENTS
 from app.db.mongodb import get_database
 from app.models.application import final_status_for, is_real_application, status_for_api
+from app.services.opportunity_counter_service import refresh_opportunity_counts
 from app.utils.mongo import serialize_mongo
 from app.utils.object_id import to_object_id
 
@@ -240,6 +241,7 @@ async def bulk_reject_interviewed(opportunity_id: str) -> dict:
     applications = await db[APPLICATIONS].find(query).to_list(length=None)
 
     affected = 0
+    opportunity_ids = set()
     for app in applications:
         old_status = status_for_api(app)
         await db[APPLICATIONS].update_one(
@@ -269,7 +271,11 @@ async def bulk_reject_interviewed(opportunity_id: str) -> dict:
                 "created_at": now,
             }
         )
+        opportunity_ids.add(str(object_id))
         affected += 1
+
+    for opportunity_id_to_refresh in sorted(opportunity_ids):
+        await refresh_opportunity_counts(opportunity_id_to_refresh)
 
     return {"marked_not_selected": affected, "opportunity_id": str(object_id)}
 

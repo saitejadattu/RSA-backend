@@ -112,7 +112,6 @@ def opportunity_fields(row: dict[str, str]) -> dict[str, Any]:
         "filled_form_count": pick(row, "# Filled Form"),
         "interested_count": pick(row, "# Interested"),
         "date_of_sharing_profiles": pick(row, "Date of Sharing Profiles"),
-        "shortlists_count": pick(row, "# shortlists"),
         "company_status": pick(row, "Company Status"),
         "process_datetime": pick(row, "Date  & Time of Process", "Date & Time of Process"),
         "process_details": pick(row, "Company Process Details"),
