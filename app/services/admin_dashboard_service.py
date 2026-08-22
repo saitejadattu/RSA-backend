@@ -150,7 +150,34 @@ async def get_admin_dashboard() -> dict:
                         }
                     }
                 },
-                "shortlists_count": {"$ifNull": ["$shortlists_count", 0]},
+                # Same evidence as shortlist import / backfill_shortlists_count.py.
+                # Do not use hiring_opportunities.shortlists_count here: Master sync
+                # $sets that field from the sheet "# shortlists" column (often 0).
+                "shortlists_count": {
+                    "$size": {
+                        "$filter": {
+                            "input": "$applications",
+                            "as": "application",
+                            "cond": {
+                                "$or": [
+                                    {"$eq": ["$$application.shortlist.is_shortlisted", True]},
+                                    {"$eq": ["$$application.screening.decision", "shortlisted"]},
+                                    {
+                                        "$in": [
+                                            {
+                                                "$ifNull": [
+                                                    "$$application.current_status",
+                                                    "$$application.status",
+                                                ]
+                                            },
+                                            ["SHORTLISTED", "shortlisted"],
+                                        ]
+                                    },
+                                ]
+                            },
+                        }
+                    }
+                },
             }
         },
         {"$sort": {"opportunity_received_at": -1, "updated_at": -1}},

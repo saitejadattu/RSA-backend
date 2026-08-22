@@ -318,5 +318,46 @@ async def test_http_failures_include_safe_status_and_detail():
     assert result["error_detail"] == "run the manual full import first"
 
 
+@pytest.mark.asyncio
+async def test_opportunity_results_include_master_created_and_updated_statuses(monkeypatch):
+    monkeypatch.setattr(incremental_sync, "get_settings", lambda: Settings())
+
+    async def master(**kwargs):
+        return {
+            "processed_opportunities": [
+                {"opportunity_id": "new-opp-1", "is_new": True, "company": "Company A", "role": "Role A"},
+                {"opportunity_id": "updated-opp-2", "is_new": False, "company": "Company B", "role": "Role B"},
+            ]
+        }
+
+    async def full_sync(**kwargs):
+        return {"counts": {"rows": 1}}
+
+    async def response_inc(**kwargs):
+        return {"rows_processed": 1, "skipped": 0}
+
+    async def shortlist_inc(**kwargs):
+        return {"rows_processed": 1, "skipped": 0}
+
+    monkeypatch.setattr(incremental_sync, "import_master_incremental_from_url", master)
+    monkeypatch.setattr(incremental_sync, "sync_from_sheet", full_sync)
+    monkeypatch.setattr(incremental_sync, "sync_response_sheet_incremental", response_inc)
+    monkeypatch.setattr(incremental_sync, "sync_shortlist_sheet_incremental", shortlist_inc)
+
+    summary = await incremental_sync.run_incremental_sync()
+
+    results = summary["opportunity_results"]
+    assert len(results) == 2
+    assert results[0]["opportunity_id"] == "new-opp-1"
+    assert results[0]["master"] == {"status": "created"}
+    assert results[0]["response"]["status"] == "SUCCESS"
+    assert results[0]["shortlist"]["status"] == "SUCCESS"
+
+    assert results[1]["opportunity_id"] == "updated-opp-2"
+    assert results[1]["master"] == {"status": "updated"}
+    assert results[1]["response"]["status"] == "SUCCESS"
+    assert results[1]["shortlist"]["status"] == "SUCCESS"
+
+
 async def _async_value(value):
     return value

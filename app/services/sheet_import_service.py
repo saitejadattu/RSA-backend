@@ -2088,7 +2088,7 @@ async def import_master(
             {"$set": set_fields, "$setOnInsert": {"source": "company_master_paste", "created_at": now}},
             upsert=True,
         )
-        if collect_opportunity_ids:
+        if collect_opportunity_ids or confirm:
             imported_opportunity = await db[HIRING_OPPORTUNITIES].find_one(opportunity_filter, {"_id": 1})
             if imported_opportunity and imported_opportunity.get("_id") is not None:
                 opportunity_id = str(imported_opportunity["_id"])
@@ -2096,6 +2096,7 @@ async def import_master(
                 processed_opportunities.append({
                     "opportunity_id": opportunity_id,
                     "is_new": existing_opportunity is None,
+                    "master": {"status": "created" if existing_opportunity is None else "updated"},
                     "company": name,
                     "role": role,
                     "received_on": received_on,
@@ -2105,9 +2106,10 @@ async def import_master(
         preview.append(entry)
 
     result = {"mode": "applied" if confirm else "preview", "counts": counts, "rows": preview}
-    if collect_opportunity_ids:
+    if collect_opportunity_ids or confirm:
         result["opportunity_ids"] = list(dict.fromkeys(opportunity_ids))
         result["processed_opportunities"] = processed_opportunities
+        result["opportunity_results"] = processed_opportunities
     return serialize_mongo(result)
 
 

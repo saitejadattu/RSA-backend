@@ -122,6 +122,7 @@ async def run_incremental_sync(*, master_url: str | None = None) -> dict:
         opportunity_result = {
             "opportunity_id": opportunity_id,
             "is_new": is_new,
+            "master": {"status": "created" if is_new else "updated"},
             "company": processed.get("company"),
             "role": processed.get("role"),
             "received_on": processed.get("received_on"),
