@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
 
 
 class TranscriptTextUpload(BaseModel):
@@ -96,3 +98,102 @@ class TranscriptConfirmRequest(BaseModel):
     round_name: str = "Interview"
     round_type: str | None = None
     source: str = "paste"
+
+
+class ManualReportAnswer(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    question_id: str | None = None
+    question_text: str = Field(..., min_length=1)
+    student_answer: str | None = None
+    accuracy: float = Field(default=0, ge=0, le=100)
+    correctness: Literal["correct", "partial", "incorrect", "not_answered"] = "not_answered"
+    feedback: str | None = None
+    ideal_answer: str | None = None
+
+
+class ManualReportOverall(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    score: float = Field(default=0, ge=0, le=10)
+    verdict: Literal["strong", "average", "weak"] = "average"
+    summary: str | None = None
+
+
+class ManualReportCommunication(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    clarity: float = Field(default=0, ge=0, le=5)
+    confidence: float = Field(default=0, ge=0, le=5)
+    notes: str | None = None
+
+
+class ManualReportImprovement(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    area: str = Field(..., min_length=1)
+    detail: str = Field(..., min_length=1)
+    priority: Literal["high", "medium", "low"] = "medium"
+
+
+class ManualCandidateReport(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    overall: ManualReportOverall = Field(default_factory=ManualReportOverall)
+    answers: list[ManualReportAnswer] = Field(default_factory=list)
+    strengths: list[str] = Field(default_factory=list)
+    improvements: list[ManualReportImprovement] = Field(default_factory=list)
+    skill_ratings: dict[str, float] = Field(default_factory=dict)
+    communication: ManualReportCommunication = Field(default_factory=ManualReportCommunication)
+    interviewer_feedback: str | None = None
+    interviewer_satisfaction: str | None = None
+    coaching_note: str | None = None
+
+
+class ManualCandidateAnalysis(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    candidate_name: str | None = Field(default=None, min_length=1)
+    speaker_label: str | None = Field(default=None, min_length=1)
+    report: ManualCandidateReport
+
+
+class ManualQuestion(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    candidate_name: str | None = Field(default=None, min_length=1)
+    speaker_label: str | None = Field(default=None, min_length=1)
+    question_text: str = Field(..., min_length=1)
+    raw_question_text: str | None = None
+    category: str = "other"
+    topic: str | None = None
+    difficulty: Literal["easy", "medium", "hard"] = "medium"
+    is_technical: bool = False
+    question_type: str = "other"
+    is_reusable: bool = False
+    model_answer: str | None = None
+    why_asked: str | None = None
+    prepare: list[str] | str = Field(default_factory=list)
+
+    @field_validator("prepare")
+    @classmethod
+    def validate_prepare(cls, value: list[str] | str) -> list[str]:
+        items = [value] if isinstance(value, str) else value
+        if len(items) > 5:
+            raise ValueError("prepare must contain at most 5 items")
+        return items
+
+
+class ManualCompanyExpectations(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    expectations: str = ""
+    focus: list[str] = Field(default_factory=list)
+
+
+class ManualAnalysisRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    candidates: list[ManualCandidateAnalysis] = Field(..., min_length=1)
+    questions: list[ManualQuestion] = Field(default_factory=list)
+    company_expectations: ManualCompanyExpectations | None = None

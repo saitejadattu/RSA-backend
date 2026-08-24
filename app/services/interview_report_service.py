@@ -32,6 +32,11 @@ from app.models.interview_report import (
     utc_now,
 )
 from app.services.ai_service import analyze_candidate_block, analyze_company_summary
+from app.services.interview_persistence_service import (
+    persist_candidate_report,
+    persist_company_expectations,
+    persist_questions,
+)
 from app.services.transcript_service import (
     build_speaker_map,
     candidate_blocks,
@@ -631,86 +636,6 @@ async def update_speaker_map(session_id: str, mapping: list[dict[str, Any]]) -> 
     return serialize_mongo({"session_id": session_object_id, "speaker_map": rebuilt})
 
 
-async def _persist_questions(db, *, session, questions: list[dict], asked_to: str | None, now) -> dict[str, Any]:
-    """Upsert each extracted question, keyed by (session, question_key) so a
-    re-run replaces rather than duplicates. Returns question_key -> _id."""
-    key_to_id: dict[str, Any] = {}
-    for item in questions:
-        # question_text is the AI's rewritten, standalone form; raw_question_text
-        # is what was actually said. The bank shows the rewrite.
-        text = fix_asr_terms((item.get("question_text") or "").strip())
-        raw = fix_asr_terms((item.get("raw_question_text") or "").strip())
-        key = question_key(text)
-        if not key or key in key_to_id:
-            continue
-        document = {
-            "session_id": session["_id"],
-            "company_id": session.get("company_id"),
-            "opportunity_id": session.get("opportunity_id"),
-            "question_text": text,
-            "raw_question_text": raw or None,
-            "question_key": key,
-            "category": normalize_category(item.get("category")),
-            "topic": (item.get("topic") or "").strip() or None,
-            "difficulty": normalize_difficulty(item.get("difficulty")),
-            "is_technical": bool(item.get("is_technical")),
-            "question_type": normalize_question_type(item.get("question_type")),
-            # Gate for the student practice bank: a follow-up like "Which one?"
-            # is a real question but useless to anyone who wasn't in the room.
-            # Three gates, all must pass to reach the student practice bank:
-            # the model's own judgement, "is it technical", and a hard check
-            # that the wording isn't tied to this room. The model reliably
-            # rewrites grammar but still lets "Can you show me your tool..."
-            # through as reusable, so the last gate is not redundant.
-            "is_reusable": (
-                bool(item.get("is_reusable"))
-                and bool(item.get("is_technical"))
-                and not looks_context_bound(text)
-            ),
-            "model_answer": (item.get("model_answer") or "").strip() or None,
-            "why_asked": (item.get("why_asked") or "").strip() or None,
-            "prepare": [p.strip() for p in (item.get("prepare") or []) if (p or "").strip()][:5],
-            # NOTE: asked_to holds a student's name. It must never be returned
-            # to students - see student_practice_questions().
-            "asked_to": asked_to,
-            "segment_order": item.get("segment_order"),
-            "updated_at": now,
-        }
-        result = await db[QUESTIONS].find_one_and_update(
-            {"session_id": session["_id"], "question_key": key},
-            {"$set": document, "$setOnInsert": {"created_at": now}},
-            upsert=True,
-            return_document=True,
-        )
-        key_to_id[key] = result["_id"]
-    return key_to_id
-
-
-def _build_report_answers(report: dict, key_to_id: dict[str, Any]) -> list[dict[str, Any]]:
-    answers = []
-    for answer in report.get("answers", []):
-        text = fix_asr_terms((answer.get("question_text") or "").strip())
-        key = question_key(text)
-        correctness = normalize_correctness(answer.get("correctness"))
-        accuracy = clamp(answer.get("accuracy"), 0, 100)
-        # A question the candidate never answered must not carry an accuracy
-        # score - otherwise "not answered" reads as a partially correct answer.
-        if correctness == "not_answered":
-            accuracy = 0.0
-        answers.append(
-            {
-                "question_id": key_to_id.get(key),
-                "question_text": text,
-                "student_answer": (answer.get("student_answer") or "").strip() or None,
-                "accuracy": accuracy,
-                "correctness": correctness,
-                "feedback": (answer.get("feedback") or "").strip() or None,
-                "ideal_answer": (answer.get("ideal_answer") or "").strip() or None,
-            }
-        )
-    return answers
-
-
 # Statuses that sit BEFORE the interview: analysing a transcript proves the
 # interview happened, so these advance. Anything further along (SELECTED,
 # OFFER_*, JOINED) or already closed (REJECTED, DROPPED) is left alone - a
@@ -907,7 +832,7 @@ async def analyze_session(session_id: str) -> dict:
 
         now = utc_now()
         model_used = analysis.get("_model")
-        key_to_id = await _persist_questions(
+        key_to_id = await persist_questions(
             db, session=session, questions=analysis.get("questions", []), asked_to=label, now=now
         )
         all_question_keys.update(key_to_id.keys())
@@ -926,68 +851,24 @@ async def analyze_session(session_id: str) -> dict:
                     {"$set": {"scheduled_at": interview_date, "started_at": interview_date}},
                 )
 
-        report = analysis.get("report") or {}
-        document = {
-            "session_id": session_object_id,
-            "student_id": student_id,
-            "application_id": application_by_student.get(student_id),
-            "company_id": session.get("company_id"),
-            "opportunity_id": session.get("opportunity_id"),
-            "speaker_label": label,
-            "block": {"start_order": block["start_order"], "end_order": block["end_order"]},
-            "overall": {
-                "score": clamp(report.get("score"), 0, 10),
-                "verdict": normalize_verdict(report.get("verdict")),
-                "summary": (report.get("summary") or "").strip() or None,
-            },
-            "answers": _build_report_answers(report, key_to_id),
-            "strengths": [s.strip() for s in report.get("strengths", []) if (s or "").strip()],
-            "improvements": [
-                {
-                    "area": (imp.get("area") or "").strip() or None,
-                    "detail": (imp.get("detail") or "").strip() or None,
-                    "priority": (imp.get("priority") or "medium").strip().lower(),
-                }
-                for imp in report.get("improvements", [])
-            ],
-            "skill_ratings": {
-                (rating.get("skill") or "").strip().lower(): clamp(rating.get("rating"), 0, 5)
-                for rating in report.get("skill_ratings", [])
-                if (rating.get("skill") or "").strip()
-            },
-            "communication": {
-                "clarity": clamp((report.get("communication") or {}).get("clarity"), 0, 5),
-                "confidence": clamp((report.get("communication") or {}).get("confidence"), 0, 5),
-                "notes": ((report.get("communication") or {}).get("notes") or "").strip() or None,
-            },
-            # The interviewer's own words, kept separate from anything the model
-            # generated - it is the most trustworthy feedback in the room.
-            "interviewer_feedback": (report.get("interviewer_feedback") or "").strip() or None,
-            # Admin-only: how well they met the interviewer's bar + how to coach
-            # them for next time. Not projected to the student endpoint.
-            "interviewer_satisfaction": (report.get("interviewer_satisfaction") or "").strip() or None,
-            "coaching_note": (report.get("coaching_note") or "").strip() or None,
-            "ai_model": analysis.get("_model"),
-            "ai_provider": analysis.get("_provider"),
-            "ai_status": "completed",
-            "transcript_truncated": bool(analysis.get("_truncated")),
-            "interview_date": interview_date,
-            "generated_at": now,
-            "updated_at": now,
-        }
-
-        result = await db[INTERVIEW_REPORTS].find_one_and_update(
-            {"session_id": session_object_id, "student_id": student_id},
-            {
-                "$set": document,
-                # Never silently re-publish: a re-run keeps the existing gate,
-                # and a brand-new report starts hidden from the student.
-                "$setOnInsert": {"visible_to_student": False, "created_at": now},
-            },
-            upsert=True,
-            return_document=True,
+        report_id = await persist_candidate_report(
+            db,
+            session_id=session_object_id,
+            student_id=student_id,
+            application_id=application_by_student.get(student_id),
+            company_id=session.get("company_id"),
+            opportunity_id=session.get("opportunity_id"),
+            speaker_label=label,
+            block={"start_order": block["start_order"], "end_order": block["end_order"]},
+            report=analysis.get("report") or {},
+            key_to_id=key_to_id,
+            ai_model=analysis.get("_model"),
+            ai_provider=analysis.get("_provider"),
+            transcript_truncated=bool(analysis.get("_truncated")),
+            interview_date=interview_date,
+            now=now,
         )
-        written.append(result["_id"])
+        written.append(report_id)
 
     final_status = "completed" if written and not failures else ("failed" if not written else "partial")
     await db[INTERVIEW_SESSIONS].update_one(
@@ -1004,14 +885,13 @@ async def analyze_session(session_id: str) -> dict:
     # Supplementary: a failure here must never fail the per-student reports.
     try:
         company = await analyze_company_summary(transcript_text=transcript_to_text(segments), context=context)
-        await db[INTERVIEW_SESSIONS].update_one(
-            {"_id": session_object_id},
-            {"$set": {"company_expectations": {
-                "expectations": (company.get("expectations") or "").strip() or None,
-                "focus": [f.strip() for f in (company.get("focus") or []) if (f or "").strip()][:6],
-                "generated_at": utc_now(),
-                "ai_model": company.get("_model"),
-            }}},
+        await persist_company_expectations(
+            db,
+            session_id=session_object_id,
+            expectations=company.get("expectations"),
+            focus=company.get("focus") or [],
+            ai_model=company.get("_model"),
+            now=utc_now(),
         )
     except Exception:
         pass
