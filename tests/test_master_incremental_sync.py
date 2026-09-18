@@ -1,9 +1,18 @@
-import pytest
-from fastapi import HTTPException
 from datetime import datetime, timezone
 
-from app.services import sheet_import_service
+import pytest
+from bson import ObjectId
+from fastapi import HTTPException
+
 from app.db.collections import COMPANIES, HIRING_OPPORTUNITIES
+from app.services import sheet_import_service
+
+URL = "https://docs.google.com/spreadsheets/d/id/edit"
+HEADER = "Opportunity Received On\tReceived Time\tCompany Name\tRole\tStudent Response Sheet\tCompany Sheet\n"
+
+
+def sheet(*rows):
+    return HEADER + "".join("\t".join(row + ("",) * (6 - len(row))) + "\n" for row in rows)
 
 
 @pytest.mark.parametrize("url", [
@@ -15,163 +24,329 @@ def test_valid_google_sheet_url_forms_are_accepted(url):
     assert sheet_import_service.sheet_export_url(url).startswith("https://docs.google.com/spreadsheets/d/id/export")
 
 
-class Cursor:
-    def __init__(self, items):
-        self.items = items
+# ---- in-memory Mongo: just enough of find / bulk_write for the master import ----
 
-    def sort(self, *args):
+def _matches(doc, query):
+    for key, expected in query.items():
+        value = doc.get(key)
+        if isinstance(expected, dict):
+            if "$in" in expected and value not in expected["$in"]:
+                return False
+            if "$type" in expected and not isinstance(value, datetime):
+                return False
+        elif value != expected:
+            return False
+    return True
+
+
+class Cursor:
+    def __init__(self, docs):
+        self.docs = docs
+
+    def sort(self, field, direction):
+        self.docs = sorted(self.docs, key=lambda doc: doc[field], reverse=direction == -1)
         return self
 
-    def limit(self, *args):
+    def limit(self, count):
+        self.docs = self.docs[:count]
         return self
 
     async def to_list(self, length=None):
-        return list(self.items)
+        return [dict(doc) for doc in self.docs]
 
 
-class Opportunities:
-    def __init__(self, documents):
-        self.documents = documents
+class Collection:
+    def __init__(self, db):
+        self.db = db
+        self.docs = []
 
     def find(self, query, projection=None):
-        if "opportunity_received_at" in query:
-            documents = [doc for doc in self.documents if doc.get("opportunity_received_at")]
-        elif "source_sheet_row" in query and "$gt" in query["source_sheet_row"]:
-            documents = [doc for doc in self.documents if doc.get("source_sheet_row", 0) > query["source_sheet_row"]["$gt"]]
-        else:
-            documents = self.documents
-        return Cursor(documents)
+        self.db.calls += 1
+        return Cursor([doc for doc in self.docs if _matches(doc, query)])
 
-    async def find_one(self, query, projection=None):
-        return None
+    async def bulk_write(self, operations, ordered=True):
+        self.db.calls += 1
+        for operation in operations:
+            update = operation._doc
+            doc = next((item for item in self.docs if _matches(item, operation._filter)), None)
+            if doc is None:
+                if not operation._upsert:
+                    continue
+                doc = {"_id": ObjectId(), **operation._filter, **update.get("$setOnInsert", {})}
+                self.docs.append(doc)
+            doc.update(update.get("$set", {}))
+            for field in update.get("$unset", {}):
+                doc.pop(field, None)
+            for field, value in update.get("$addToSet", {}).items():
+                values = doc.setdefault(field, [])
+                if value not in values:
+                    values.append(value)
 
 
 class Database:
-    def __init__(self, documents):
-        self.opportunities = Opportunities(documents)
+    def __init__(self):
+        self.calls = 0
+        self.collections = {COMPANIES: Collection(self), HIRING_OPPORTUNITIES: Collection(self)}
 
     def __getitem__(self, name):
-        assert name in {HIRING_OPPORTUNITIES, COMPANIES}
-        return self.opportunities
+        return self.collections[name]
+
+    def opportunities(self):
+        return self.collections[HIRING_OPPORTUNITIES].docs
+
+    def seed(self, name, role, received_at, **extra):
+        """Store an opening the way Mongo returns it: with a naive datetime."""
+        key = sheet_import_service.company_key
+        company = next((c for c in self[COMPANIES].docs if c["company_key"] == key(name)), None)
+        if company is None:
+            company = {"_id": ObjectId(), "company_key": key(name), "name": name}
+            self[COMPANIES].docs.append(company)
+        doc = {
+            "_id": ObjectId(),
+            "company_id": company["_id"],
+            "company_name": name,
+            "role": role,
+            "role_key": key(role),
+            "opportunity_key": key(received_at.replace(tzinfo=timezone.utc).isoformat()),
+            "opportunity_received_at": received_at,
+            **extra,
+        }
+        self[HIRING_OPPORTUNITIES].docs.append(doc)
+        return doc
 
 
-class FakeHTTPResponse:
-    def __init__(self, text):
-        self.status_code = 200
-        self.headers = {"content-type": "text/csv; charset=utf-8"}
-        self.text = text
+@pytest.fixture
+def db(monkeypatch):
+    database = Database()
+    monkeypatch.setattr(sheet_import_service, "get_database", lambda: database)
+    return database
 
 
-class FakeHTTPClient:
-    requests = []
+# ---- full import ----
 
-    def __init__(self, *args, **kwargs):
-        pass
+@pytest.mark.asyncio
+async def test_full_import_does_not_query_per_row(db):
+    rows = [("1-Sep-2026", "10:00 AM", f"Company {n}", "AI Intern") for n in range(60)]
 
-    async def __aenter__(self):
-        return self
+    result = await sheet_import_service.import_master(raw_text=sheet(*rows), confirm=True)
 
-    async def __aexit__(self, exc_type, exc, traceback):
-        return False
-
-    async def get(self, url, params):
-        self.requests.append(params)
-        if params["range"] == "A1:ZZ1":
-            return FakeHTTPResponse("Company Name,Role,Opportunity Received On\n")
-        return FakeHTTPResponse("Acme,Engineer,22-Aug-2026\n")
+    # Load companies + write companies + re-read companies + write openings + read ids.
+    assert db.calls <= 6
+    assert result["counts"]["opportunities_to_create"] == 60
+    assert len(db.opportunities()) == 60
+    assert len(result["opportunity_ids"]) == 60
+    assert db.opportunities()[0]["source_sheet_row"] == 2
 
 
 @pytest.mark.asyncio
-async def test_bounded_master_fetch_requests_csv_and_parses_master_row(monkeypatch):
-    FakeHTTPClient.requests = []
-    monkeypatch.setattr(sheet_import_service.httpx, "AsyncClient", FakeHTTPClient)
+async def test_preview_uses_two_queries_and_writes_nothing(db):
+    db.seed("Acme", "AI Intern", datetime(2026, 9, 1, 10))
+    before = [dict(doc) for doc in db.opportunities()]
 
-    raw_text = await sheet_import_service.fetch_master_incremental_text(
-        "https://docs.google.com/spreadsheets/d/id/edit?gid=123#gid=123", 340, 379
+    result = await sheet_import_service.import_master(
+        raw_text=sheet(("1-Sep-2026", "10:00 AM", "Acme", "AI Intern"), ("2-Sep-2026", "", "Globex", "SDE")),
     )
-    rows = sheet_import_service.read_response_rows(raw_text)
 
-    assert all(request["tqx"] == "out:csv" for request in FakeHTTPClient.requests)
-    assert [request["range"] for request in FakeHTTPClient.requests] == ["A1:ZZ1", "A340:ZZ379"]
-    assert rows == [{
-        "company_name": "Acme",
-        "role": "Engineer",
-        "opportunity_received_on": "22-Aug-2026",
-    }]
+    assert db.calls == 2
+    assert db.opportunities() == before
+    assert result["counts"]["opportunities_to_update"] == 1
+    assert result["counts"]["opportunities_to_create"] == 1
 
 
 @pytest.mark.asyncio
-async def test_incremental_uses_date_checkpoint_and_bounded_window(monkeypatch):
-    requested_start = None
-    requested_end = None
-    imported = {}
-    checkpoint = datetime(2026, 8, 21, tzinfo=timezone.utc)
-    monkeypatch.setattr(sheet_import_service, "get_database", lambda: Database([{"source_sheet_row": 350, "opportunity_received_at": checkpoint}]))
+async def test_reimport_updates_instead_of_duplicating(db):
+    text = sheet(("1-Sep-2026", "10:00 AM", "Acme", "AI Intern"), ("2-Sep-2026", "", "Globex", "SDE"))
 
-    async def fetch(url, start_row, end_row):
-        nonlocal requested_start, requested_end
-        requested_start = start_row
-        requested_end = end_row
-        return "Company Name\tRole\tOpportunity Received On\nAcme\tEngineer\t22-Aug-2026\n"
+    first = await sheet_import_service.import_master(raw_text=text, confirm=True)
+    second = await sheet_import_service.import_master(raw_text=text, confirm=True)
 
-    async def import_rows(*, raw_text, confirm, source_row_offset, collect_opportunity_ids):
-        imported.update(raw_text=raw_text, confirm=confirm, source_row_offset=source_row_offset, collect_opportunity_ids=collect_opportunity_ids)
-        return {"counts": {"rows": 1, "opportunities_to_create": 1, "opportunities_to_update": 0, "companies_new": 1, "companies_existing": 0, "skipped": 0}, "opportunity_ids": ["new-opp"]}
-
-    monkeypatch.setattr(sheet_import_service, "fetch_master_incremental_text", fetch)
-    monkeypatch.setattr(sheet_import_service, "import_master", import_rows)
-
-    result = await sheet_import_service.import_master_incremental_from_url(url="https://docs.google.com/spreadsheets/d/id/edit")
-
-    assert requested_start == 340
-    assert requested_end == 379
-    assert imported["confirm"] is True
-    assert imported["source_row_offset"] == 338
-    assert imported["collect_opportunity_ids"] is True
-    assert result["rows_scanned"] == 1
-    assert result["opportunities_created"] == 1
-    assert result["opportunity_ids"] == ["new-opp"]
+    assert len(db.opportunities()) == 2
+    assert second["counts"]["opportunities_to_create"] == 0
+    # Nothing in the sheet moved, so nothing is written - but both openings are
+    # still returned, so their responses and shortlists are synced as usual.
+    assert second["counts"]["opportunities_to_update"] == 0
+    assert second["counts"]["opportunities_unchanged"] == 2
+    assert second["opportunity_ids"] == first["opportunity_ids"]
+    assert [item["master"]["status"] for item in second["processed_opportunities"]] == ["unchanged", "unchanged"]
 
 
 @pytest.mark.asyncio
-async def test_incremental_processes_multiple_new_rows_without_duplicates(monkeypatch):
-    checkpoint = datetime(2026, 8, 21, tzinfo=timezone.utc)
-    monkeypatch.setattr(sheet_import_service, "get_database", lambda: Database([{"source_sheet_row": 350, "opportunity_received_at": checkpoint}]))
+async def test_duplicate_rows_in_one_import_create_once_then_update(db):
+    row = ("1-Sep-2026", "10:00 AM", "Acme", "AI Intern")
 
-    async def fetch(url, start_row, end_row):
-        return (
-            "Company Name\tRole\tOpportunity Received On\n"
-            "Company A\tEngineer\t22-Aug-2026\n"
-            "Company B\tEngineer\t22-Aug-2026\n"
-            "Company A\tEngineer\t22-Aug-2026\n"
-        )
+    result = await sheet_import_service.import_master(raw_text=sheet(row, row), confirm=True)
 
-    imported_rows = []
+    assert len(db.opportunities()) == 1
+    assert result["counts"]["opportunities_to_create"] == 1
+    assert result["counts"]["opportunities_to_update"] == 1
+    assert [item["is_new"] for item in result["processed_opportunities"]] == [True, False]
 
-    async def import_rows(*, raw_text, confirm, source_row_offset, collect_opportunity_ids):
-        imported_rows.extend(sheet_import_service.read_response_rows(raw_text))
-        return {"counts": {"rows": len(imported_rows), "opportunities_to_create": 2, "opportunities_to_update": 0, "companies_new": 2, "companies_existing": 0, "skipped": 0}, "opportunity_ids": ["a", "b"]}
 
-    monkeypatch.setattr(sheet_import_service, "fetch_master_incremental_text", fetch)
-    monkeypatch.setattr(sheet_import_service, "import_master", import_rows)
+@pytest.mark.asyncio
+async def test_real_role_upgrades_unknown_role_opening_on_same_day(db):
+    existing = db.seed("Acme", "unknown", datetime(2026, 8, 20, 9))
 
-    result = await sheet_import_service.import_master_incremental_from_url(url="https://docs.google.com/spreadsheets/d/id/edit")
+    result = await sheet_import_service.import_master(
+        raw_text=sheet(("20-Aug-2026", "12:00 PM", "Acme", "Flutter Intern")), confirm=True,
+    )
 
-    assert len(imported_rows) == 3
+    assert result["counts"]["opportunities_to_update"] == 1
+    assert len(db.opportunities()) == 1
+    assert existing["role_key"] == "flutter-intern"
+
+
+@pytest.mark.asyncio
+async def test_changed_columns_are_listed_and_unchanged_rows_are_not_written(db):
+    """A full sync must say which columns moved, not call every row an update."""
+    existing = db.seed(
+        "Acme", "AI Intern", datetime(2026, 9, 1, 10),
+        opportunity_received_on="1-Sep-2026", received_time="10:00 AM",
+        stipend="20000", location="Remote",
+    )
+    existing["updated_at"] = "untouched"
+
+    result = await sheet_import_service.import_master(
+        raw_text=HEADER.rstrip("\n") + "\tStipend\tLocation\n"
+        + "1-Sep-2026\t10:00 AM\tAcme\tAI Intern\t\t\t25000\tRemote\n",
+        confirm=True,
+    )
+
+    row = result["rows"][0]
+    assert row["action"] == "update_opportunity"
+    assert row["changes"] == [{"field": "stipend", "old": "20000", "new": "25000"}]
+    assert result["counts"]["opportunities_to_update"] == 1
+    assert result["counts"]["opportunities_unchanged"] == 0
+    assert existing["stipend"] == "25000"
+    assert existing["updated_at"] != "untouched"
+
+
+@pytest.mark.asyncio
+async def test_deleted_opening_comes_back_when_its_row_is_still_in_the_sheet(db):
+    """Re-adding a deleted opening restores it - with its applications - rather
+    than being silently skipped or duplicated."""
+    deleted = db.seed(
+        "Rajlaxmi Solutions", "SDE Intern", datetime(2026, 9, 8, 22, 45),
+        deleted_at=datetime(2026, 9, 12, 12, 53), deleted_by={"email": "admin@example.com"},
+        deletion_reason="for testing",
+    )
+
+    result = await sheet_import_service.import_master(
+        raw_text=sheet(("8-Sep-2026", "10:45 PM", "Rajlaxmi Solutions", "SDE Intern")), confirm=True,
+    )
+
+    assert len(db.opportunities()) == 1  # restored in place, not duplicated
+    assert result["counts"]["opportunities_to_restore"] == 1
+    assert result["rows"][0]["action"] == "restore_opportunity"
+    assert result["processed_opportunities"][0]["master"]["status"] == "restored"
+    assert result["processed_opportunities"][0]["restored"] is True
+    assert "deleted_at" not in deleted and "deletion_reason" not in deleted
+    assert deleted["restored_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_incremental_restores_a_deleted_opening_older_than_the_checkpoint(db, monkeypatch):
+    """The checkpoint must not hide a deleted row: it is older than the newest
+    opening, but it is the row that brings the opening back."""
+    deleted = db.seed(
+        "Rajlaxmi Solutions", "SDE Intern", datetime(2026, 9, 8, 22, 45),
+        deleted_at=datetime(2026, 9, 12, 12, 53),
+    )
+    db.seed("Newer Co", "AI Intern", datetime(2026, 9, 15, 14, 29))
+    text = sheet(
+        ("8-Sep-2026", "10:45 PM", "Rajlaxmi Solutions", "SDE Intern"),
+        ("15-Sep-2026", "2:29 PM", "Newer Co", "AI Intern"),
+    )
+
+    async def fetch(url):
+        return text
+
+    monkeypatch.setattr(sheet_import_service, "fetch_sheet_text", fetch)
+
+    result = await sheet_import_service.import_master_incremental_from_url(url=URL)
+
+    assert result["opportunities_restored"] == 1
+    assert "deleted_at" not in deleted
+    restored = [item for item in result["processed_opportunities"] if item["restored"]]
+    assert [item["company"] for item in restored] == ["Rajlaxmi Solutions"]
+
+
+@pytest.mark.asyncio
+async def test_changed_response_link_is_stamped(db):
+    existing = db.seed("Acme", "AI Intern", datetime(2026, 9, 1, 10), student_response_sheet="https://old")
+
+    result = await sheet_import_service.import_master(
+        raw_text=sheet(("1-Sep-2026", "10:00 AM", "Acme", "AI Intern", "https://new")), confirm=True,
+    )
+
+    assert result["counts"]["response_links_changed"] == 1
+    assert existing["previous_student_response_sheet"] == "https://old"
+    assert existing["student_response_sheet"] == "https://new"
+
+
+# ---- pull only newly added ----
+
+@pytest.mark.asyncio
+async def test_incremental_picks_up_new_rows_whatever_their_date_or_position(db, monkeypatch):
+    # The newest opening carries a stale row position (row 2) - the anchor that
+    # made the old windowed sync read February rows and import nothing.
+    db.seed("Old Co", "SDE", datetime(2026, 2, 4))
+    db.seed("Verona Matchmaking", "Mobile Intern", datetime(2026, 9, 7, 12, 50), source_sheet_row=387)
+    db.seed("Blue Machines AI", "FDE Intern", datetime(2026, 9, 11, 15, 18), source_sheet_row=2)
+    text = sheet(
+        ("4-Feb-2026", "", "Old Co", "SDE"),
+        ("7-Sep-2026", "12:50 PM", "Verona Matchmaking", "Mobile Intern"),
+        ("8-Sep-2026", "10:45 PM", "Rajlaxmi Solutions", "SDE Intern"),
+        ("11-Sep-2026", "15:18", "Blue Machines AI", "FDE Intern"),
+        ("9-Sep-2026", "2:02 PM", "Freight Tiger", "SDE intern"),
+    )
+
+    async def fetch(url):
+        return text
+
+    monkeypatch.setattr(sheet_import_service, "fetch_sheet_text", fetch)
+
+    result = await sheet_import_service.import_master_incremental_from_url(url=URL)
+
+    processed = [(item["company"], item["is_new"]) for item in result["processed_opportunities"]]
+    assert processed == [("Rajlaxmi Solutions", True), ("Blue Machines AI", False), ("Freight Tiger", True)]
+    assert result["rows_scanned"] == 5
     assert result["opportunities_created"] == 2
+    assert result["opportunities_updated"] == 1
+    assert len(db.opportunities()) == 5
 
 
 @pytest.mark.asyncio
-async def test_incremental_empty_range_is_successful_noop(monkeypatch):
-    checkpoint = datetime(2026, 8, 21, tzinfo=timezone.utc)
-    monkeypatch.setattr(sheet_import_service, "get_database", lambda: Database([{"source_sheet_row": 350, "opportunity_received_at": checkpoint}]))
+async def test_incremental_with_nothing_new_is_a_successful_noop(db, monkeypatch):
+    db.seed("Acme", "AI Intern", datetime(2026, 9, 1, 10))
+    db.seed("Globex", "SDE", datetime(2026, 9, 5, 9))
+    text = sheet(
+        ("", "", "", "Orphan role"),                      # old junk rows stay out of scope
+        ("", "", "5 days a week, 9-6", ""),
+        ("1-Sep-2026", "10:00 AM", "Acme", "AI Intern"),
+    )
 
-    async def fetch_empty(url, start_row, end_row):
-        return "Company Name\tRole\n"
+    async def fetch(url):
+        return text
 
-    monkeypatch.setattr(sheet_import_service, "fetch_master_incremental_text", fetch_empty)
+    monkeypatch.setattr(sheet_import_service, "fetch_sheet_text", fetch)
 
-    result = await sheet_import_service.import_master_incremental_from_url(url="https://docs.google.com/spreadsheets/d/id/edit")
+    result = await sheet_import_service.import_master_incremental_from_url(url=URL)
+
+    assert result["rows_processed"] == 0
+    assert result["rows_skipped"] == 0
+    assert "No new opportunities found" in result["message"]
+
+
+@pytest.mark.asyncio
+async def test_incremental_header_only_sheet_is_a_noop(db, monkeypatch):
+    db.seed("Acme", "AI Intern", datetime(2026, 9, 1, 10))
+
+    async def fetch(url):
+        return HEADER
+
+    monkeypatch.setattr(sheet_import_service, "fetch_sheet_text", fetch)
+
+    result = await sheet_import_service.import_master_incremental_from_url(url=URL)
 
     assert result["mode"] == "incremental"
     assert result["rows_scanned"] == 0
@@ -180,20 +355,9 @@ async def test_incremental_empty_range_is_successful_noop(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_incremental_requires_full_sync_watermark(monkeypatch):
-    monkeypatch.setattr(sheet_import_service, "get_database", lambda: Database([]))
-
+async def test_incremental_requires_full_sync_first(db):
     with pytest.raises(HTTPException) as error:
-        await sheet_import_service.import_master_incremental_from_url(url="https://docs.google.com/spreadsheets/d/id/edit")
+        await sheet_import_service.import_master_incremental_from_url(url=URL)
 
     assert error.value.status_code == 409
     assert "Fetch entire sheet data first" in str(error.value.detail)
-
-
-@pytest.mark.asyncio
-async def test_incremental_invalid_url_is_clear_error():
-    with pytest.raises(HTTPException) as error:
-        await sheet_import_service.fetch_master_incremental_text("not-a-sheet", 2)
-
-    assert error.value.status_code == 422
-    assert "Master incremental sync failed" in str(error.value.detail)

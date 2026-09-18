@@ -6,7 +6,7 @@ from fastapi import HTTPException, status
 from app.db.collections import APPLICATIONS, COMPANIES, HIRING_OPPORTUNITIES, STATUS_HISTORY, STUDENTS
 from app.db.mongodb import get_database
 from app.models.application import final_status_for, is_real_application, status_for_api
-from app.services.opportunity_counter_service import refresh_opportunity_counts
+from app.services.opportunity_counter_service import is_shortlisted_application, refresh_opportunity_counts
 from app.utils.mongo import serialize_mongo
 from app.utils.object_id import to_object_id
 
@@ -25,6 +25,7 @@ def _blank_counts() -> dict:
         "response_count": 0,
         "applied_count": 0,
         "shortlisted_count": 0,
+        "not_shortlisted_count": 0,
         "interview_completed_count": 0,
         "rejected_count": 0,
         "hired_count": 0,
@@ -40,8 +41,12 @@ def _tally(counts: dict, application: dict) -> None:
 
     counts["applied_count"] += 1
     current_status = status_for_api(application)
-    if current_status == "SHORTLISTED" or current_status == "shortlisted":
+    # Uses the counter service's definition, so a card and the stored counter
+    # cannot disagree about who is shortlisted.
+    if is_shortlisted_application(application):
         counts["shortlisted_count"] += 1
+    elif current_status in {"NOT_SHORTLISTED", "not_shortlisted"}:
+        counts["not_shortlisted_count"] += 1
     elif current_status in {"INTERVIEW_COMPLETED", "interview_completed", "INTERVIEW_DONE", "interview_done"}:
         counts["interview_completed_count"] += 1
     elif current_status == "REJECTED" or current_status == "rejected":
@@ -157,7 +162,9 @@ async def get_admin_opportunity_detail(opportunity_id: str) -> dict:
     counts = _blank_counts()
     for application in applicants:
         _tally(counts, application)
-    counts["shortlisted_count"] = opportunity.get("shortlists_count", 0) or 0
+    # Counted from the applications themselves, never read back from the stored
+    # counter: that field is derived, and a master import used to overwrite it
+    # with the CRM's "# shortlists" cell - blanking a real shortlist to zero.
 
     return serialize_mongo(
         {

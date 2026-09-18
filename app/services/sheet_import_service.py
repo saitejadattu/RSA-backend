@@ -20,8 +20,10 @@ from typing import Any
 import httpx
 from bson import ObjectId
 from fastapi import HTTPException, status
-from pymongo import ReturnDocument
+from pymongo import UpdateOne
+from pymongo.errors import DuplicateKeyError
 
+from app.config.settings import get_settings
 from app.db.collections import (
     APPLICATIONS,
     COMPANIES,
@@ -154,7 +156,12 @@ def parse_timestamp(value: str | None) -> datetime | None:
             return datetime.strptime(value.strip(), fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-    return None
+    # Our own sync checkpoints are stored as ISO 8601 ("2026-01-02T12:00:00Z").
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 # --- resilient column detection -------------------------------------------
@@ -639,40 +646,6 @@ async def fetch_sheet_text(url: str | None) -> str:
     return response.text
 
 
-async def fetch_master_incremental_text(url: str, start_row: int, end_row: int | None = None) -> str:
-    """Fetch the master header and a bounded data-row range."""
-    export = sheet_export_url(url)
-    if not export:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Master incremental sync failed: that doesn't look like a Google Sheets link.",
-        )
-    document = SHEET_ID_RE.search(url)
-    gid_match = SHEET_GID_RE.search(url)
-    if not document:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid master sheet URL")
-    gviz = f"https://docs.google.com/spreadsheets/d/{document.group(1)}/gviz/tq"
-    params = {"tqx": "out:csv", "gid": gid_match.group(1) if gid_match else "0"}
-    try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-            header_response = await client.get(gviz, params={**params, "range": "A1:ZZ1"})
-            requested_range = f"A{start_row}:ZZ{end_row}" if end_row else f"A{start_row}:ZZ"
-            rows_response = await client.get(gviz, params={**params, "range": requested_range})
-    except httpx.HTTPError as exc:
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Master incremental sync failed: {exc}") from exc
-
-    for response in (header_response, rows_response):
-        content_type = response.headers.get("content-type", "").lower()
-        if response.status_code != 200 or "html" in content_type:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Master incremental sync failed: the sheet is not publicly accessible.",
-            )
-    if not header_response.text.strip():
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Master incremental sync failed: header row is empty.")
-    return f"{header_response.text.rstrip(chr(10))}\n{rows_response.text.lstrip(chr(10))}" if rows_response.text.strip() else header_response.text
-
-
 async def fetch_response_incremental_text(url: str, start_row: int) -> str:
     """Fetch the response header and only rows after the saved source-row watermark."""
     export = sheet_export_url(url)
@@ -758,11 +731,11 @@ async def sync_response_sheet_incremental(*, opportunity_id: str) -> dict:
     response_sync = opportunity.get("response_sync") or {}
     last_timestamp = response_sync.get("last_processed_response_timestamp")
     last_row = response_sync.get("last_processed_row")
-    if not last_timestamp and last_row is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Response incremental sync failed: run the manual full response import first to establish the response checkpoint.",
-        )
+    if (not last_timestamp and last_row is None) or link_changed_since_import(opportunity, "responses"):
+        # No usable checkpoint - never imported, imported before checkpoints were
+        # recorded, or the link now points at a different sheet: run the normal
+        # full import, which records the checkpoint for next time.
+        return await sync_from_sheet(opportunity_id=opportunity_id, kind="responses", confirm=True, force=True)
 
     raw_text = await fetch_sheet_text(url)
     all_rows = read_response_rows(raw_text)
@@ -848,6 +821,73 @@ async def sync_response_sheet_incremental(*, opportunity_id: str) -> dict:
     })
 
 
+# kind -> (sheet URL field, imported-at stamp, link-changed stamp, name used in messages)
+SHEET_KINDS = {
+    "responses": ("student_response_sheet", "responses_imported_at", "response_sheet_changed_at", "response"),
+    "shortlist": ("company_sheet", "shortlist_imported_at", "company_sheet_changed_at", "company / shortlist"),
+}
+
+
+def link_changed_since_import(opportunity: dict, kind: str) -> bool:
+    """A link that changed after the last import points at a corrected sheet,
+    which should be pulled in full rather than skipped or read incrementally."""
+    _, stamp_field, changed_field, _ = SHEET_KINDS[kind]
+    stamp, changed_at = opportunity.get(stamp_field), opportunity.get(changed_field)
+    return bool(changed_at and (not stamp or changed_at > stamp))
+
+
+def is_empty_sheet(raw_text: str) -> bool:
+    """Only a header, or nothing: the form / company sheet exists but nobody is on it yet."""
+    text = raw_text or ""
+    records = csv.reader(io.StringIO(text, newline=""), delimiter=_sniff_delimiter(text[:2000]))
+    return sum(1 for record in records if any((cell or "").strip() for cell in record)) <= 1
+
+
+def _response_sheet_checkpoint(raw_text: str) -> dict | None:
+    """The checkpoint after a full response import - the newest submission and
+    its row - so Pull only new continues from there. None when the sheet has no
+    timestamps; every sync then stays a full import, which is still correct."""
+    latest = None
+    for row_index, row in enumerate(read_response_rows(raw_text), start=2):
+        submitted_at, source_row, _ = _response_checkpoint(row, row_index)
+        if submitted_at and (latest is None or submitted_at >= latest[0]):
+            latest = (submitted_at, source_row)
+    if latest is None:
+        return None
+    now = datetime.now(timezone.utc)
+    return {
+        "last_processed_response_timestamp": latest[0].isoformat().replace("+00:00", "Z"),
+        "last_processed_row": latest[1],
+        "last_processed_at": now,
+        "last_successful_sync_at": now,
+    }
+
+
+async def import_fetched_sheet(
+    db, opportunity: dict, kind: str, raw_text: str, url: str, *, confirm: bool, replace: bool = False
+) -> dict:
+    """Import a downloaded response / shortlist sheet - the one path every sync uses."""
+    if is_empty_sheet(raw_text):
+        return serialize_mongo({
+            "mode": "skipped",
+            "kind": kind,
+            "source_url": url,
+            "message": f"The {SHEET_KINDS[kind][3]} sheet has no rows yet.",
+        })
+    opportunity_id = str(opportunity["_id"])
+    if kind == "responses":
+        result = await import_responses(
+            opportunity_id=opportunity_id, raw_text=raw_text, confirm=confirm, replace=replace
+        )
+        checkpoint = _response_sheet_checkpoint(raw_text) if confirm else None
+        if checkpoint:
+            await db[HIRING_OPPORTUNITIES].update_one({"_id": opportunity["_id"]}, {"$set": {"response_sync": checkpoint}})
+    else:
+        result = await import_shortlist(opportunity_id=opportunity_id, raw_text=raw_text, confirm=confirm)
+    result["source_url"] = url
+    return result
+
+
 async def sync_from_sheet(
     *, opportunity_id: str, kind: str, confirm: bool = False, force: bool = False, replace: bool = False
 ) -> dict:
@@ -861,27 +901,16 @@ async def sync_from_sheet(
     fixed after a wrong/no-access sheet was linked, and we don't want to re-pull
     the ones already done every time.
     """
+    if kind not in SHEET_KINDS:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="kind must be responses or shortlist")
     db = get_database()
     opportunity, _ = await load_opportunity(db, opportunity_id)
-
-    if kind == "responses":
-        url = opportunity.get("student_response_sheet")
-        stamp = opportunity.get("responses_imported_at")
-        link_changed_at = opportunity.get("response_sheet_changed_at")
-        missing = "response"
-    elif kind == "shortlist":
-        url = opportunity.get("company_sheet")
-        stamp = opportunity.get("shortlist_imported_at")
-        link_changed_at = opportunity.get("company_sheet_changed_at")
-        missing = "company / shortlist"
-    else:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="kind must be responses or shortlist")
+    url_field, stamp_field, _, missing = SHEET_KINDS[kind]
+    url = opportunity.get(url_field)
+    stamp = opportunity.get(stamp_field)
 
     # Skip an already-imported opening only if its link hasn't changed since.
-    # A link that changed after the last import points at a corrected sheet and
-    # should be pulled, not skipped.
-    link_changed_since = bool(link_changed_at and (not stamp or link_changed_at > stamp))
-    if stamp and not force and not link_changed_since:
+    if stamp and not force and not link_changed_since_import(opportunity, kind):
         return serialize_mongo({
             "mode": "skipped",
             "kind": kind,
@@ -896,14 +925,7 @@ async def sync_from_sheet(
         )
 
     raw_text = await fetch_sheet_text(url)
-    if kind == "responses":
-        result = await import_responses(
-            opportunity_id=opportunity_id, raw_text=raw_text, confirm=confirm, replace=replace
-        )
-    else:
-        result = await import_shortlist(opportunity_id=opportunity_id, raw_text=raw_text, confirm=confirm)
-    result["source_url"] = url
-    return result
+    return await import_fetched_sheet(db, opportunity, kind, raw_text, url, confirm=confirm, replace=replace)
 
 
 async def auto_sync_response_and_shortlist(*, opportunity_id: str) -> dict:
@@ -1175,7 +1197,15 @@ async def import_responses(
                 password_hash=hash_password(identity["phone"]),
             )
             document.update({k: v for k, v in student_update_fields(row, identity).items() if v is not None})
-            student_id = (await db[STUDENTS].insert_one(document)).inserted_id
+            try:
+                student_id = (await db[STUDENTS].insert_one(document)).inserted_id
+            except DuplicateKeyError:
+                # Openings sync side by side, so another opening's import may have
+                # created this student a moment ago - use that record.
+                student = await find_student(db, identity)
+                if not student:
+                    raise
+                student_id = student["_id"]
 
         fields = build_application_fields(
             row, opportunity=opportunity, company=company, student_id=student_id,
@@ -1724,11 +1754,14 @@ async def sync_shortlist_sheet_incremental(*, opportunity_id: str) -> dict:
         })
 
     response_sync = opportunity.get("shortlist_sync") or {}
-    if "source_record_ids" not in response_sync or "shortlisted_student_ids" not in response_sync:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Shortlist incremental sync failed: run the manual full shortlist import first to establish the shortlist checkpoint.",
-        )
+    if (
+        "source_record_ids" not in response_sync
+        or "shortlisted_student_ids" not in response_sync
+        or link_changed_since_import(opportunity, "shortlist")
+    ):
+        # No checkpoint yet, or the link now points at a different sheet: run the
+        # normal full import, which records the checkpoint.
+        return await sync_from_sheet(opportunity_id=opportunity_id, kind="shortlist", confirm=True, force=True)
 
     raw_text = await fetch_sheet_text(url)
     header_rows = read_response_rows(raw_text)
@@ -1737,20 +1770,13 @@ async def sync_shortlist_sheet_incremental(*, opportunity_id: str) -> dict:
     if is_header_source:
         rows = header_rows
         source_ids = [pick(row, field_map["uid"] or "") for row in rows]
-        if any(not value or not UUID_RE.fullmatch(value) for value in source_ids):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Shortlist incremental sync requires a stable UUID in every shortlist row. Use the manual full shortlist sync for this sheet.",
-            )
     else:
-        positional_rows = read_shortlist_rows(raw_text)
-        rows = positional_rows
+        rows = read_shortlist_rows(raw_text)
         source_ids = [extract_shortlist_row(row).get("uid") for row in rows]
-        if any(not value or not UUID_RE.fullmatch(value) for value in source_ids):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Shortlist incremental sync requires a stable UUID in every shortlist row. Use the manual full shortlist sync for this sheet.",
-            )
+    if any(not value or not UUID_RE.fullmatch(value) for value in source_ids):
+        # Without a stable UUID on every row, new rows can't be told from old
+        # ones - re-import the sheet in full instead (it reconciles, so it is safe).
+        return await import_fetched_sheet(db, opportunity, "shortlist", raw_text, url, confirm=True)
 
     previous_record_ids = set(response_sync.get("source_record_ids") or [])
     previous_student_ids = set(response_sync.get("shortlisted_student_ids") or [])
@@ -1900,7 +1926,11 @@ def master_opportunity_fields(row: dict[str, str | None]) -> dict[str, Any]:
         "filled_form_count": pick(row, "# Filled Form"),
         "interested_count": pick(row, "# Interested"),
         "date_of_sharing_profiles": pick(row, "Date of Sharing Profiles"),
-        "shortlists_count": pick(row, "# shortlists"),
+        # The CRM's own "# shortlists" note. Kept under its own name: the
+        # shortlists_count the dashboard reads is COUNTED from the shortlist
+        # sheet, and a master import must not overwrite it with this text (a
+        # blank cell here used to blank the real count on every sync).
+        "master_shortlists_count": pick(row, "# shortlists"),
         "company_status": pick(row, "Company Status"),
         "process_datetime": pick(row, "Date  & Time of Process", "Date & Time of Process"),
         "process_details": pick(row, "Company Process Details"),
@@ -1923,42 +1953,275 @@ def master_opportunity_fields(row: dict[str, str | None]) -> dict[str, Any]:
     }
 
 
+# Every opening column the master sheet owns. Used to load an existing opening
+# for the change diff, so a full sync can say which columns actually changed
+# instead of reporting every row as "updated".
+MASTER_COLUMN_FIELDS = tuple(master_opportunity_fields({}).keys())
+
+# Written on every import but not part of "did this row change": bookkeeping,
+# the raw row, and the link-change stamps (derived from the links themselves).
+NON_COMPARED_FIELDS = frozenset({
+    "updated_at", "raw_company_row", "source_sheet_row",
+    "response_sheet_changed_at", "previous_student_response_sheet",
+    "company_sheet_changed_at", "previous_company_sheet",
+})
+
+
 def is_unknown_role(role: str | None) -> bool:
     return not (role or "").strip() or (role or "").strip().lower() == "unknown"
 
 
-async def find_existing_master_opportunity(
-    db, *, company_id, role_key: str, opportunity_key: str, opportunity_received_at: datetime | None
-) -> dict | None:
-    """Find an exact opportunity, or upgrade an unknown role on the same date."""
-    exact = await db[HIRING_OPPORTUNITIES].find_one(
-        {"company_id": company_id, "role_key": role_key, "opportunity_key": opportunity_key},
-        {"_id": 1, "role": 1, "student_response_sheet": 1, "company_sheet": 1},
-    )
-    if exact or not opportunity_received_at or is_unknown_role(role_key):
-        return exact
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Mongo hands dates back naive; treat them as the UTC they were stored in."""
+    if value is None or value.tzinfo is not None:
+        return value
+    return value.replace(tzinfo=timezone.utc)
 
-    start = opportunity_received_at.replace(hour=0, minute=0, second=0, microsecond=0)
-    end = start + timedelta(days=1)
-    return await db[HIRING_OPPORTUNITIES].find_one(
+
+def _comparable(value: Any) -> Any:
+    """One value as the diff sees it: blank and missing are the same thing, and a
+    naive stored date is the UTC it was written as."""
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, datetime):
+        return _as_utc(value)
+    return value
+
+
+def master_row_changes(existing: dict | None, set_fields: dict[str, Any]) -> list[dict[str, Any]]:
+    """The columns this master row actually changes on an existing opening.
+
+    A full sync re-writes every column of every row, so without this an admin is
+    told 400 openings were "updated" when only two cells moved. Bookkeeping
+    fields are ignored - they change on every import by definition.
+    """
+    if existing is None:
+        return []
+    changes = []
+    for field, new_value in set_fields.items():
+        if field in NON_COMPARED_FIELDS:
+            continue
+        old_value = _comparable(existing.get(field))
+        if old_value != _comparable(new_value):
+            changes.append({"field": field, "old": old_value, "new": _comparable(new_value)})
+    return changes
+
+
+class MasterIndex:
+    """Existing companies and openings for one master import, held in memory.
+
+    Loaded with two queries up front instead of several per row (per-row lookups
+    made a full-sheet import take minutes), then kept current as rows are planned
+    so a later row sees what an earlier row in the same import created or
+    upgraded. Openings are keyed by company_key, which a new company has before
+    it has an _id.
+    """
+
+    def __init__(self, company_keys_by_id: dict, opportunities: list[dict]):
+        self.companies: set[str] = set(company_keys_by_id.values())
+        self.exact: dict[tuple, dict] = {}
+        self.unknown: dict[str, list[dict]] = {}
+        for doc in opportunities:
+            ckey = company_keys_by_id.get(doc.get("company_id"))
+            if ckey:
+                self._add(ckey, doc)
+
+    def _add(self, ckey: str, doc: dict) -> None:
+        self.exact[(ckey, doc.get("role_key"), doc.get("opportunity_key"))] = doc
+        if is_unknown_role(doc.get("role_key")):
+            self.unknown.setdefault(ckey, []).append(doc)
+
+    def has_company(self, ckey: str) -> bool:
+        return ckey in self.companies
+
+    def find(self, ckey: str, role_key: str, opportunity_key: str, received_at: datetime | None) -> dict | None:
+        """The exact opening, or an unknown-role opening on the same date to upgrade."""
+        exact = self.exact.get((ckey, role_key, opportunity_key))
+        if exact or not received_at or is_unknown_role(role_key):
+            return exact
+        day = received_at.date()
+        for doc in self.unknown.get(ckey, []):
+            stored = _as_utc(doc.get("opportunity_received_at"))
+            if stored and stored.date() == day:
+                return doc
+        return None
+
+    def record(self, ckey: str, existing: dict | None, fields: dict) -> None:
+        """Reflect a planned write so later rows in the same import see it."""
+        self.companies.add(ckey)
+        doc = existing if existing is not None else {}
+        if existing is not None:
+            self.exact.pop((ckey, existing.get("role_key"), existing.get("opportunity_key")), None)
+            if ckey in self.unknown:
+                self.unknown[ckey] = [item for item in self.unknown[ckey] if item is not existing]
+        doc.update(fields)
+        self._add(ckey, doc)
+
+
+async def load_master_index(db, company_keys: set[str]) -> MasterIndex:
+    if not company_keys:
+        return MasterIndex({}, [])
+    companies = await db[COMPANIES].find(
+        {"company_key": {"$in": sorted(company_keys)}}, {"_id": 1, "company_key": 1}
+    ).to_list(length=None)
+    keys_by_id = {company["_id"]: company["company_key"] for company in companies}
+    # Archived openings are loaded too (no deleted_at filter): the sheet is the
+    # source of truth, so a row that comes back must restore the opening it was
+    # deleted from - with its applications - instead of creating a second one.
+    projection = {
+        "_id": 1, "company_id": 1, "role": 1, "role_key": 1, "opportunity_key": 1,
+        "opportunity_received_at": 1, "opportunity_received_on": 1, "received_time": 1,
+        "company_name": 1, "deleted_at": 1,
+        **{field: 1 for field in MASTER_COLUMN_FIELDS},
+    }
+    opportunities = await db[HIRING_OPPORTUNITIES].find(
+        {"company_id": {"$in": list(keys_by_id)}}, projection,
+    ).to_list(length=None) if keys_by_id else []
+    return MasterIndex(keys_by_id, opportunities)
+
+
+async def recent_openings_for_refresh(*, days: int, exclude_ids: set[str] | None = None) -> list[dict]:
+    """Live openings received in the last `days`, as the sync pipeline's opening
+    records.
+
+    Pull only new creates the openings the Master sheet just gained, but the ones
+    it created yesterday keep receiving applicants. These are the openings it
+    refreshes alongside, so no one has to press Force on an opening by hand.
+    """
+    db = get_database()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    excluded = exclude_ids or set()
+    openings = await db[HIRING_OPPORTUNITIES].find(
+        {"deleted_at": {"$exists": False}, "opportunity_received_at": {"$gte": cutoff}},
         {
-            "company_id": company_id,
-            "opportunity_received_at": {"$gte": start, "$lt": end},
-            "role_key": {"$in": ["", "unknown", None]},
+            "_id": 1, "company_id": 1, "company_name": 1, "role": 1,
+            "opportunity_received_on": 1, "student_response_sheet": 1, "company_sheet": 1,
         },
-        {"_id": 1, "role": 1, "student_response_sheet": 1, "company_sheet": 1},
-    )
+    ).sort("opportunity_received_at", -1).to_list(length=None)
+    openings = [doc for doc in openings if str(doc["_id"]) not in excluded]
+    if not openings:
+        return []
+
+    names = {
+        company["_id"]: company.get("name")
+        for company in await db[COMPANIES].find(
+            {"_id": {"$in": list({doc.get("company_id") for doc in openings})}}, {"_id": 1, "name": 1}
+        ).to_list(length=None)
+    }
+    return [
+        {
+            "opportunity_id": str(doc["_id"]),
+            "is_new": False,
+            "restored": False,
+            "refresh": True,
+            "master": {"status": "unchanged"},
+            "company": names.get(doc.get("company_id")) or doc.get("company_name"),
+            "role": doc.get("role"),
+            "received_on": doc.get("opportunity_received_on"),
+            "response_url_present": bool((doc.get("student_response_sheet") or "").strip()),
+            "shortlist_url_present": bool((doc.get("company_sheet") or "").strip()),
+        }
+        for doc in openings
+    ]
+
+
+async def _apply_master_plan(db, planned: list[dict[str, Any]], now: datetime) -> list[dict[str, Any]]:
+    """Write the planned rows with batched round trips (not several per row) and
+    return the processed openings, in sheet order, with their ids.
+
+    A row that changes nothing is still returned - its responses and shortlist
+    are synced like any other - but nothing is written for it, so a re-sync of an
+    unchanged sheet leaves the openings and companies exactly as they were.
+    """
+    writable = [item for item in planned if item["write"]]
+    if writable:
+        await db[COMPANIES].bulk_write([
+            UpdateOne(
+                {"company_key": item["ckey"]},
+                {
+                    "$set": {"name": item["name"], "company_key": item["ckey"], "updated_at": now},
+                    "$setOnInsert": {"created_at": now},
+                    "$addToSet": {"aliases": item["name"], "sources": "company_master_paste"},
+                },
+                upsert=True,
+            )
+            for item in writable
+        ], ordered=True)
+    company_ids = {
+        company["company_key"]: company["_id"]
+        for company in await db[COMPANIES].find(
+            {"company_key": {"$in": sorted({item["ckey"] for item in planned})}}, {"_id": 1, "company_key": 1}
+        ).to_list(length=None)
+    }
+
+    operations = []
+    for item in writable:
+        company_id = company_ids[item["ckey"]]
+        fields = item["set_fields"]
+        target = item["target"]
+        if target is None:
+            opportunity_filter = {"company_id": company_id, "role_key": fields["role_key"], "opportunity_key": fields["opportunity_key"]}
+        elif "_id" in target:
+            opportunity_filter = target
+        else:
+            opportunity_filter = {"company_id": company_id, **target}
+        update: dict[str, Any] = {
+            "$set": {"company_id": company_id, **fields},
+            "$setOnInsert": {"source": "company_master_paste", "created_at": now},
+        }
+        if item["restored"]:
+            # The sheet still carries this opening, so an earlier delete is undone
+            # here - the opening and its applications come back as they were.
+            update["$unset"] = {"deleted_at": "", "deleted_by": "", "deletion_reason": ""}
+            update["$set"]["restored_at"] = now
+        operations.append(UpdateOne(opportunity_filter, update, upsert=True))
+    if operations:
+        await db[HIRING_OPPORTUNITIES].bulk_write(operations, ordered=True)
+
+    ids_by_identity = {
+        (doc["company_id"], doc.get("role_key"), doc.get("opportunity_key")): doc["_id"]
+        for doc in await db[HIRING_OPPORTUNITIES].find(
+            {"company_id": {"$in": list(company_ids.values())}},
+            {"_id": 1, "company_id": 1, "role_key": 1, "opportunity_key": 1},
+        ).to_list(length=None)
+    }
+    processed = []
+    for item in planned:
+        fields = item["set_fields"]
+        opportunity_id = ids_by_identity.get((company_ids[item["ckey"]], fields["role_key"], fields["opportunity_key"]))
+        if opportunity_id is None:
+            continue
+        if item["is_new"]:
+            master_status = "created"
+        elif item["restored"]:
+            master_status = "restored"
+        elif item["write"]:
+            master_status = "updated"
+        else:
+            master_status = "unchanged"
+        processed.append({
+            "opportunity_id": str(opportunity_id),
+            "is_new": item["is_new"],
+            "restored": item["restored"],
+            "master": {"status": master_status, "changes": item["changes"]},
+            **item["summary"],
+        })
+    return processed
 
 
 async def import_master(
-    *, raw_text: str, confirm: bool = False, source_row_offset: int = 0,
-    collect_opportunity_ids: bool = False,
+    *, raw_text: str, confirm: bool = False, collect_opportunity_ids: bool = False,
+    since: datetime | None = None,
 ) -> dict:
     """Create companies and their openings from pasted master-tracker rows.
 
     A header row is required so columns can be matched by name. Both the company
     and each opening are upserted, so re-pasting the same rows updates rather
     than duplicating.
+
+    With `since`, a row is only considered when it is not in the database yet
+    (whatever its date or position in the sheet) or is dated on/after `since`;
+    every other row is left out of the result entirely.
     """
     db = get_database()
     rows = read_response_rows(raw_text)  # header-based TSV/CSV, same parser
@@ -1971,26 +2234,53 @@ async def import_master(
     now = datetime.now(timezone.utc)
     preview: list[dict[str, Any]] = []
     counts = {
-        "rows": len(rows),
+        "rows": 0,
         "companies_new": 0,
         "companies_existing": 0,
         "opportunities_to_create": 0,
         "opportunities_to_update": 0,
+        "opportunities_to_restore": 0,
+        "opportunities_unchanged": 0,
         "response_links_changed": 0,
         "company_links_changed": 0,
         "skipped": 0,
     }
     seen_companies: set[str] = set()
-    opportunity_ids: list[str] = []
-    processed_opportunities: list[dict[str, Any]] = []
+    planned: list[dict[str, Any]] = []
+    index = await load_master_index(
+        db, {company_key(name) for name in (pick(row, "Company Name") for row in rows) if name}
+    )
 
-    for index, row in enumerate(rows, start=1):
+    for row_number, row in enumerate(rows, start=1):
         name = pick(row, "Company Name")
         role = pick(row, "Role") or "unknown"
         received_on = pick(row, "Opportunity Received On")
         received_time = pick(row, "Received Time")
-        source_sheet_row = source_row_offset + index + 1
-        entry: dict[str, Any] = {"row": index, "source_sheet_row": source_sheet_row, "company": name, "role": role, "received_on": received_on}
+        source_sheet_row = row_number + 1
+        entry: dict[str, Any] = {"row": row_number, "source_sheet_row": source_sheet_row, "company": name, "role": role, "received_on": received_on}
+
+        # A shifted/partial row in the master lands schedule or duration text in
+        # the Company Name column ("5 days a week, 9-6", "6 Months"). Those are
+        # skipped below so they don't become junk companies.
+        valid = bool(name) and not looks_like_schedule(name)
+        ckey = company_key(name)
+        role_key = company_key(role)
+        opportunity_received_at = combine_date_time(received_on, received_time)
+        opportunity_key = company_key(
+            opportunity_received_at.isoformat()
+            if opportunity_received_at
+            else f"{received_on or 'no-date'}-{received_time or 'no-time'}"
+        )
+        existing_opportunity = index.find(ckey, role_key, opportunity_key, opportunity_received_at) if valid else None
+        archived = bool(existing_opportunity and existing_opportunity.get("deleted_at"))
+
+        if since is not None:
+            recent = bool(opportunity_received_at and opportunity_received_at >= since)
+            # An archived opening is considered whatever its date: the sheet still
+            # lists it, so this row is what brings it back.
+            if not recent and not archived and not (valid and existing_opportunity is None):
+                continue  # already imported and older than the checkpoint
+        counts["rows"] += 1
 
         if not name:
             entry["action"] = "skip"
@@ -1999,10 +2289,7 @@ async def import_master(
             preview.append(entry)
             continue
 
-        # A shifted/partial row in the master lands schedule or duration text in
-        # the Company Name column ("5 days a week, 9-6", "6 Months"). Skip those
-        # so they don't become junk companies.
-        if looks_like_schedule(name):
+        if not valid:
             entry["action"] = "skip"
             entry["reason"] = "Company Name looks like schedule/duration text - likely a shifted row in the sheet."
             entry["suspicious"] = True
@@ -2010,34 +2297,14 @@ async def import_master(
             preview.append(entry)
             continue
 
-        ckey = company_key(name)
-        existing_company = await db[COMPANIES].find_one({"company_key": ckey}, {"_id": 1})
+        is_new_company = not index.has_company(ckey)
         # Count a company once per paste even if it spans several rows.
         if ckey not in seen_companies:
             seen_companies.add(ckey)
-            counts["companies_existing" if existing_company else "companies_new"] += 1
-        entry["company_new"] = not existing_company
-
-        role_key = company_key(role)
-        opportunity_received_at = combine_date_time(received_on, received_time)
-        opportunity_key = company_key(
-            opportunity_received_at.isoformat()
-            if opportunity_received_at
-            else f"{received_on or 'no-date'}-{received_time or 'no-time'}"
-        )
+            counts["companies_new" if is_new_company else "companies_existing"] += 1
+        entry["company_new"] = is_new_company
 
         opp_fields = master_opportunity_fields(row)
-        existing_opportunity = None
-        if existing_company:
-            existing_opportunity = await find_existing_master_opportunity(
-                db,
-                company_id=existing_company["_id"],
-                role_key=role_key,
-                opportunity_key=opportunity_key,
-                opportunity_received_at=opportunity_received_at,
-            )
-        entry["action"] = "update_opportunity" if existing_opportunity else "create_opportunity"
-        counts["opportunities_to_update" if existing_opportunity else "opportunities_to_create"] += 1
 
         # Detect a changed response/shortlist sheet link so it can be re-pulled.
         # Only a real change of an existing, non-empty URL counts.
@@ -2055,23 +2322,16 @@ async def import_master(
                     counts[count_key] += 1
                     entry[count_key] = True
 
-        if not confirm:
-            preview.append(entry)
-            continue
-
-        # ---- write ----
-        company = await db[COMPANIES].find_one_and_update(
-            {"company_key": ckey},
-            {
-                "$set": {"name": name, "company_key": ckey, "updated_at": now},
-                "$setOnInsert": {"created_at": now},
-                "$addToSet": {"aliases": name, "sources": "company_master_paste"},
-            },
-            upsert=True,
-            return_document=ReturnDocument.AFTER,
-        )
+        # Where the write lands: the matched opening by _id, or - when an earlier
+        # row in this same import planned it and it has no _id yet - by the
+        # identity it has at this point.
+        if existing_opportunity is None:
+            target = None
+        elif existing_opportunity.get("_id") is not None:
+            target = {"_id": existing_opportunity["_id"]}
+        else:
+            target = {"role_key": existing_opportunity["role_key"], "opportunity_key": existing_opportunity["opportunity_key"]}
         set_fields = {
-            "company_id": company["_id"],
             "company_name": name,
             "role": role,
             "role_key": role_key,
@@ -2085,36 +2345,60 @@ async def import_master(
             "updated_at": now,
             **change_stamps,
         }
-        opportunity_filter = (
-            {"_id": existing_opportunity["_id"]}
-            if existing_opportunity
-            else {"company_id": company["_id"], "role_key": role_key, "opportunity_key": opportunity_key}
-        )
-        await db[HIRING_OPPORTUNITIES].update_one(
-            opportunity_filter,
-            {"$set": set_fields, "$setOnInsert": {"source": "company_master_paste", "created_at": now}},
-            upsert=True,
-        )
-        if collect_opportunity_ids or confirm:
-            imported_opportunity = await db[HIRING_OPPORTUNITIES].find_one(opportunity_filter, {"_id": 1})
-            if imported_opportunity and imported_opportunity.get("_id") is not None:
-                opportunity_id = str(imported_opportunity["_id"])
-                opportunity_ids.append(opportunity_id)
-                processed_opportunities.append({
-                    "opportunity_id": opportunity_id,
-                    "is_new": existing_opportunity is None,
-                    "master": {"status": "created" if existing_opportunity is None else "updated"},
+
+        # What this row actually does: create, restore a deleted opening, change
+        # some columns, or nothing at all. Only the first three are written.
+        changes = master_row_changes(existing_opportunity, set_fields)
+        is_new = existing_opportunity is None
+        if is_new:
+            entry["action"] = "create_opportunity"
+            counts["opportunities_to_create"] += 1
+        elif archived:
+            entry["action"] = "restore_opportunity"
+            counts["opportunities_to_restore"] += 1
+        elif changes:
+            entry["action"] = "update_opportunity"
+            counts["opportunities_to_update"] += 1
+        else:
+            entry["action"] = "unchanged"
+            counts["opportunities_unchanged"] += 1
+        if changes:
+            entry["changes"] = changes
+
+        index.record(ckey, existing_opportunity, {
+            "role_key": role_key,
+            "opportunity_key": opportunity_key,
+            "opportunity_received_at": opportunity_received_at,
+            "student_response_sheet": opp_fields.get("student_response_sheet"),
+            "company_sheet": opp_fields.get("company_sheet"),
+            # A restored opening is live again for any later row in this import.
+            **({"deleted_at": None} if archived else {}),
+        })
+        preview.append(entry)
+
+        if confirm:
+            planned.append({
+                "ckey": ckey,
+                "name": name,
+                "target": target,
+                "is_new": is_new,
+                "restored": archived,
+                "changes": changes,
+                "write": bool(is_new or archived or changes),
+                "set_fields": set_fields,
+                "summary": {
                     "company": name,
                     "role": role,
                     "received_on": received_on,
                     "response_url_present": bool(opp_fields.get("student_response_sheet")),
                     "shortlist_url_present": bool(opp_fields.get("company_sheet")),
-                })
-        preview.append(entry)
+                },
+            })
 
+    processed_opportunities = await _apply_master_plan(db, planned, now) if planned else []
     result = {"mode": "applied" if confirm else "preview", "counts": counts, "rows": preview}
     if collect_opportunity_ids or confirm:
-        result["opportunity_ids"] = list(dict.fromkeys(opportunity_ids))
+        result["opportunity_ids"] = list(dict.fromkeys(item["opportunity_id"] for item in processed_opportunities))
         result["processed_opportunities"] = processed_opportunities
         result["opportunity_results"] = processed_opportunities
     return serialize_mongo(result)
@@ -2132,12 +2416,45 @@ async def import_master_from_url(*, url: str, confirm: bool = False) -> dict:
     return result
 
 
+async def with_master_header(raw_text: str, url: str | None) -> str:
+    """Rows copied out of the Master sheet usually come without its header row;
+    borrow the header from the Master sheet so columns still match by name."""
+    text = (raw_text or "").lstrip("\r\n")
+    first_record = next(csv.reader(io.StringIO(text, newline=""), delimiter=_sniff_delimiter(text[:2000])), [])
+    if any(normalize_header(cell or "") == "company_name" for cell in first_record):
+        return raw_text
+    master_url = (url or get_settings().student_sheet_url or "").strip()
+    if not master_url:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "These rows have no header row. Copy the header row as well, or enter the "
+                "Master sheet link so its header can be used."
+            ),
+        )
+    master_text = await fetch_sheet_text(master_url)
+    header = next(csv.reader(io.StringIO(master_text, newline=""), delimiter="\t"), [])
+    return "\t".join(re.sub(r"\s+", " ", cell) for cell in header) + "\n" + text
+
+
+async def import_master_paste(*, raw_text: str, url: str | None = None, confirm: bool = False) -> dict:
+    """Pasted Master rows, with or without the header row."""
+    return await import_master(raw_text=await with_master_header(raw_text, url), confirm=confirm)
+
+
 async def import_master_incremental_from_url(*, url: str) -> dict:
-    """Fetch a bounded master window and import rows newer than the date checkpoint."""
+    """Import Master rows that are new, plus rows dated on/after the newest stored opening.
+
+    The whole sheet is fetched (one ~1s request) and matched against the database
+    by opening identity, so a new row is picked up wherever it sits in the sheet
+    and whatever date it carries - no row-position watermark that can drift. Rows
+    on/after the checkpoint date are re-applied too, so the latest openings keep
+    refreshing their response and shortlist data.
+    """
     db = get_database()
     latest = await db[HIRING_OPPORTUNITIES].find(
         {"opportunity_received_at": {"$type": "date"}},
-        {"opportunity_received_at": 1, "source_sheet_row": 1},
+        {"opportunity_received_at": 1},
     ).sort("opportunity_received_at", -1).limit(1).to_list(length=1)
     if not latest or latest[0].get("opportunity_received_at") is None:
         raise HTTPException(
@@ -2145,75 +2462,26 @@ async def import_master_incremental_from_url(*, url: str) -> dict:
             detail="Incremental sync requires an existing synchronized Master dataset. Run Fetch entire sheet data first.",
         )
 
-    latest_date = latest[0]["opportunity_received_at"]
-    if latest_date.tzinfo is None:
-        latest_date = latest_date.replace(tzinfo=timezone.utc)
-    source_hint = latest[0].get("source_sheet_row")
-    if source_hint is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Incremental sync requires a synchronized Master source position. Run Fetch entire sheet data first.",
-        )
-    window_start = max(2, int(source_hint) - 10)
-    window_end = window_start + 39
-    raw_text = await fetch_master_incremental_text(url, window_start, window_end)
-    rows = read_response_rows(raw_text)
-    candidate_rows: list[dict[str, str | None]] = []
-    for row in rows:
-        received_at = combine_date_time(pick(row, "Opportunity Received On"), pick(row, "Received Time"))
-        if not received_at or received_at < latest_date:
-            continue
-        name = pick(row, "Company Name")
-        role = pick(row, "Role") or "unknown"
-        company = await db[COMPANIES].find_one({"company_key": company_key(name)}, {"_id": 1}) if name else None
-        role_key = company_key(role)
-        opportunity_key = company_key(
-            received_at.isoformat()
-            if received_at
-            else f"{pick(row, 'Opportunity Received On') or 'no-date'}-{pick(row, 'Received Time') or 'no-time'}"
-        )
-        existing = None
-        if company:
-            existing = await find_existing_master_opportunity(
-                db,
-                company_id=company["_id"],
-                role_key=role_key,
-                opportunity_key=opportunity_key,
-                opportunity_received_at=received_at,
-            )
-        candidate_rows.append(row)
-
-    if not candidate_rows:
-        return {
-            "mode": "incremental",
-            "rows_scanned": len(rows),
-            "rows_processed": 0,
-            "opportunities_created": 0,
-            "opportunities_updated": 0,
-            "companies_created": 0,
-            "companies_updated": 0,
-            "rows_skipped": 0,
-            "errors": [],
-            "latest_opportunity_date": latest_date.isoformat(),
-            "opportunity_ids": [],
-            "processed_opportunities": [],
-            "message": "No new opportunities found in the incremental range. Use Fetch entire sheet data if you suspect older or missing rows.",
-        }
-
-    candidate_text = _rebuild_raw_text(list(rows[0].keys()), candidate_rows)
-    result = await import_master(
-        raw_text=candidate_text,
-        confirm=True,
-        source_row_offset=window_start - 2,
-        collect_opportunity_ids=True,
+    latest_date = _as_utc(latest[0]["opportunity_received_at"])
+    raw_text = await fetch_sheet_text(url)
+    rows_scanned = len(read_response_rows(raw_text))
+    result = (
+        await import_master(raw_text=raw_text, confirm=True, collect_opportunity_ids=True, since=latest_date)
+        if rows_scanned
+        else {}
     )
     counts = result.get("counts", {})
-    return {
+    summary = {
         "mode": "incremental",
-        "rows_scanned": counts.get("rows", 0),
-        "rows_processed": counts.get("opportunities_to_create", 0) + counts.get("opportunities_to_update", 0),
+        "rows_scanned": rows_scanned,
+        "rows_processed": (
+            counts.get("opportunities_to_create", 0)
+            + counts.get("opportunities_to_update", 0)
+            + counts.get("opportunities_to_restore", 0)
+        ),
         "opportunities_created": counts.get("opportunities_to_create", 0),
         "opportunities_updated": counts.get("opportunities_to_update", 0),
+        "opportunities_restored": counts.get("opportunities_to_restore", 0),
         "companies_created": counts.get("companies_new", 0),
         "companies_updated": counts.get("companies_existing", 0),
         "rows_skipped": counts.get("skipped", 0),
@@ -2222,3 +2490,6 @@ async def import_master_incremental_from_url(*, url: str) -> dict:
         "opportunity_ids": result.get("opportunity_ids", []),
         "processed_opportunities": result.get("processed_opportunities", []),
     }
+    if not summary["rows_processed"]:
+        summary["message"] = "No new opportunities found in the Master sheet."
+    return summary

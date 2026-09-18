@@ -52,7 +52,12 @@ def _application_counted(application: dict[str, Any]) -> bool:
     return _application_is_real(application)
 
 
-def _shortlist_counted(application: dict[str, Any]) -> bool:
+def is_shortlisted_application(application: dict[str, Any]) -> bool:
+    """The one definition of "this person is shortlisted".
+
+    Shared with the admin screens so a card and the stored counter can never
+    disagree about the same application.
+    """
     if not _application_is_real(application):
         return False
 
@@ -91,7 +96,7 @@ async def refresh_opportunity_counts(opportunity_id: str | Any) -> dict[str, int
     for application in applications:
         if _application_counted(application):
             application_count += 1
-        if _shortlist_counted(application):
+        if is_shortlisted_application(application):
             shortlists_count += 1
 
     now = datetime.now(timezone.utc)
