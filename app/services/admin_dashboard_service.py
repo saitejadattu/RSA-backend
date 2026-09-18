@@ -99,14 +99,6 @@ async def get_admin_dashboard() -> dict:
         {"$match": {"deleted_at": {"$exists": False}}},
         {
             "$lookup": {
-                "from": APPLICATIONS,
-                "localField": "_id",
-                "foreignField": "opportunity_id",
-                "as": "applications",
-            }
-        },
-        {
-            "$lookup": {
                 "from": COMPANIES,
                 "localField": "company_id",
                 "foreignField": "_id",
@@ -123,33 +115,12 @@ async def get_admin_dashboard() -> dict:
                 "stipend": 1,
                 "duration": 1,
                 "company_status": 1,
+                "student_side_status": 1,
+                "student_response_sheet": 1,
+                "company_sheet": 1,
                 "opportunity_received_at": 1,
                 "company": {"_id": "$company._id", "name": "$company.name"},
-                "response_count": {"$size": "$applications"},
-                "application_count": {
-                    "$size": {
-                        "$filter": {
-                            "input": "$applications",
-                            "as": "application",
-                            "cond": {
-                                "$and": [
-                                    {
-                                        "$ne": [
-                                            {
-                                                "$ifNull": [
-                                                    "$$application.application_details.interested",
-                                                    "$$application.is_interested",
-                                                ]
-                                            },
-                                            False,
-                                        ]
-                                    },
-                                    {"$ne": [{"$ifNull": ["$$application.current_status", "$$application.status"]}, "not_interested"]},
-                                ]
-                            },
-                        }
-                    }
-                },
+                "application_count": {"$ifNull": ["$application_count", 0]},
                 "shortlists_count": {"$ifNull": ["$shortlists_count", 0]},
             }
         },

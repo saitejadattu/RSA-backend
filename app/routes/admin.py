@@ -12,7 +12,7 @@ from app.schemas.interview_report import (
     SheetSyncRequest,
     SheetUrlRequest,
 )
-from app.schemas.admin import MasterIncrementalRequest, OpportunityDeleteRequest, StudentIssueStatusUpdate
+from app.schemas.admin import MasterIncrementalRequest, MasterPasteRequest, OpportunityDeleteRequest, StudentIssueStatusUpdate
 from app.schemas.student import StudentPlacementUpdate
 from app.services.admin_company_service import (
     archive_opportunity,
@@ -37,10 +37,11 @@ from app.services.admin_dashboard_service import (
 )
 from app.services.admin_issue_service import get_admin_issue, list_admin_issues, update_admin_issue_status
 from app.services.interview_report_service import list_questions, question_bank, set_report_visibility
+from app.services.rsa_usage_service import get_admin_rsa_usage
 from app.services.sheet_import_service import (
-    import_master,
     import_master_from_url,
     import_master_incremental_from_url,
+    import_master_paste,
     import_responses,
     import_shortlist,
     auto_sync_response_and_shortlist,
@@ -49,7 +50,7 @@ from app.services.sheet_import_service import (
     sync_response_sheet_incremental,
     update_sheet_links,
 )
-from app.jobs.incremental_sync import run_incremental_sync
+from app.jobs.incremental_sync import describe_failure, run_full_sync, run_incremental_sync, run_paste_sync
 from app.utils.dependencies import require_admin_access
 
 
@@ -67,6 +68,11 @@ async def applications(
     limit: int = Query(default=50, ge=1, le=500),
 ) -> list[dict]:
     return await list_recent_applications(limit=limit, status_value=status)
+    
+@router.get("/rsa-usage")
+async def rsa_usage() -> dict:
+     """Get RSA usage statistics."""
+     return await get_admin_rsa_usage()
 
 
 @router.get("/students")
@@ -235,11 +241,12 @@ async def report_visibility(report_id: str, payload: ReportVisibilityUpdate) -> 
 
 
 @router.post("/companies/import")
-async def import_company_master_sheet(payload: SheetPasteRequest) -> dict:
+async def import_company_master_sheet(payload: MasterPasteRequest) -> dict:
     """Paste rows from the company master tracker to create companies and their
-    openings. Send confirm=false first to preview what would change.
+    openings. The header row is optional when the Master sheet link is given.
+    Send confirm=false to preview; /sync/paste imports and loads the sheets.
     """
-    return await import_master(raw_text=payload.raw_text, confirm=payload.confirm)
+    return await import_master_paste(raw_text=payload.raw_text, url=payload.url, confirm=payload.confirm)
 
 
 @router.post("/companies/import/fetch")
@@ -306,13 +313,35 @@ async def incremental_sync_shortlist_sheet(opportunity_id: str) -> dict:
     return await sync_shortlist_sheet_incremental(opportunity_id=opportunity_id)
 
 
+async def _sync_reply(run) -> dict:
+    """502 only when the Master stage itself failed; openings that could not be
+    synced ride along in a 200 (status PARTIAL) with their errors."""
+    result = await run
+    if result.get("status") == "FAILED":
+        return JSONResponse(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            content={**jsonable_encoder(result), "detail": describe_failure(result)},
+        )
+    return result
+
+
 @router.post("/sync/incremental")
 async def manual_incremental_sync(payload: MasterIncrementalRequest | None = None) -> dict:
-    """Run the Phase 4 incremental pipeline from an authenticated admin UI."""
-    result = await run_incremental_sync(master_url=payload.url if payload else None)
-    if result.get("status") == "FAILED":
-        return JSONResponse(status_code=status.HTTP_502_BAD_GATEWAY, content=jsonable_encoder(result))
-    return result
+    """Pull only new: new Master rows, then their responses and shortlists."""
+    return await _sync_reply(run_incremental_sync(master_url=payload.url if payload else None))
+
+
+@router.post("/sync/full")
+async def full_sheet_sync(payload: MasterIncrementalRequest) -> dict:
+    """Fetch entire sheet: every Master row, then responses and shortlists for
+    the openings never imported or whose sheet link changed."""
+    return await _sync_reply(run_full_sync(master_url=payload.url))
+
+
+@router.post("/sync/paste")
+async def pasted_rows_sync(payload: MasterPasteRequest) -> dict:
+    """Pasted Master rows (header optional), then their responses and shortlists."""
+    return await _sync_reply(run_paste_sync(raw_text=payload.raw_text, master_url=payload.url))
 
 
 @router.post("/opportunities/{opportunity_id}/sync/{kind}")

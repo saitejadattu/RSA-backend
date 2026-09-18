@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, Query
 
 from app.schemas.interview_report import (
+    ManualAnalysisRequest,
     SpeakerMapUpdate,
     TranscriptConfirmRequest,
     TranscriptProposeRequest,
@@ -23,6 +24,7 @@ from app.services.interview_report_service import (
     save_transcript,
     update_speaker_map,
 )
+from app.services.manual_analysis_service import preview_manual_analysis, save_manual_analysis
 from app.services.interview_session_service import (
     create_interview_session,
     get_interview_session,
@@ -145,6 +147,16 @@ async def fix_speaker_map(session_id: str, payload: SpeakerMapUpdate) -> dict:
 async def run_analysis(session_id: str) -> dict:
     """Extract the question bank and generate one RSA report per student."""
     return await analyze_session(session_id)
+
+
+@router.post("/{session_id}/manual-analysis/preview", dependencies=[Depends(require_admin_access)])
+async def preview_manual(session_id: str, payload: ManualAnalysisRequest) -> dict:
+    return await preview_manual_analysis(session_id, payload)
+
+
+@router.post("/{session_id}/manual-analysis", dependencies=[Depends(require_admin_access)])
+async def save_manual(session_id: str, payload: ManualAnalysisRequest) -> dict:
+    return await save_manual_analysis(session_id, payload)
 
 
 @router.get("/{session_id}/reports", dependencies=[Depends(require_admin_access)])

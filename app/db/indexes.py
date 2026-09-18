@@ -1,4 +1,4 @@
-from pymongo import ASCENDING
+from pymongo import ASCENDING, DESCENDING
 from pymongo.errors import OperationFailure
 
 from app.db.collections import (
@@ -10,6 +10,7 @@ from app.db.collections import (
     INTERVIEW_REPORTS,
     INTERVIEW_SESSIONS,
     QUESTIONS,
+    RSA_USAGE,
     STATUS_HISTORY,
     STUDENTS,
     TRANSCRIPTS,
@@ -126,3 +127,7 @@ async def create_indexes() -> None:
     await db[INTERVIEW_REPORTS].create_index([("company_id", ASCENDING)])
     await db[INTERVIEW_REPORTS].create_index([("opportunity_id", ASCENDING)])
     await db[INTERVIEW_REPORTS].create_index([("generated_at", ASCENDING)])
+
+    # RSA usage tracking indexes
+    await db[RSA_USAGE].create_index([("student_id", ASCENDING), ("opened_at", DESCENDING)])
+    await db[RSA_USAGE].create_index([("opened_at", DESCENDING)])

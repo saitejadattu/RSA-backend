@@ -1,7 +1,8 @@
 import pytest
-from fastapi import HTTPException
 
 from app.services import sheet_import_service
+
+URL = "https://docs.google.com/spreadsheets/d/abc/edit"
 
 
 class FakeCollection:
@@ -31,11 +32,17 @@ SHEET = (
 )
 
 
+@pytest.fixture(autouse=True)
+def no_counter_refresh(monkeypatch):
+    # The opening counters live in another service with its own database handle.
+    monkeypatch.setattr(sheet_import_service, "refresh_opportunity_counts", lambda opportunity_id: _async_value(None))
+
+
 @pytest.mark.asyncio
 async def test_incremental_shortlist_processes_only_unseen_uuid_rows(monkeypatch):
     opportunity = {
         "_id": "opp-a",
-        "company_sheet": "https://docs.google.com/spreadsheets/d/abc/edit",
+        "company_sheet": URL,
         "shortlist_sync": {
             "source_record_ids": ["11111111-1111-1111-1111-111111111111"],
             "shortlisted_student_ids": ["student-a"],
@@ -72,7 +79,7 @@ async def test_incremental_shortlist_processes_only_unseen_uuid_rows(monkeypatch
 async def test_incremental_shortlist_rerun_is_idempotent(monkeypatch):
     opportunity = {
         "_id": "opp-a",
-        "company_sheet": "https://docs.google.com/spreadsheets/d/abc/edit",
+        "company_sheet": URL,
         "shortlist_sync": {
             "source_record_ids": ["11111111-1111-1111-1111-111111111111"],
             "shortlisted_student_ids": ["student-a"],
@@ -123,27 +130,53 @@ async def test_incremental_shortlist_skips_missing_sheet(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_incremental_shortlist_requires_uuid_baseline_and_source_ids(monkeypatch):
-    opportunity = {
-        "_id": "opp-c",
-        "company_sheet": "https://docs.google.com/spreadsheets/d/abc/edit",
-        "shortlist_sync": {"source_record_ids": [], "shortlisted_student_ids": []},
-    }
+async def test_incremental_shortlist_without_checkpoint_runs_the_full_import(monkeypatch):
+    opportunity = {"_id": "opp-e", "company_sheet": URL}
+    calls = []
     monkeypatch.setattr(sheet_import_service, "get_database", lambda: FakeDB())
     monkeypatch.setattr(sheet_import_service, "load_opportunity", lambda db, opportunity_id: _async_value((opportunity, {})))
-    monkeypatch.setattr(sheet_import_service, "fetch_sheet_text", lambda url: _async_value("Full Name\tResume\nAlice\thttp://resume\n"))
 
-    with pytest.raises(HTTPException) as exc_info:
-        await sheet_import_service.sync_shortlist_sheet_incremental(opportunity_id="opp-c")
+    async def full_import(**kwargs):
+        calls.append(kwargs)
+        return {"mode": "applied", "counts": {}}
 
-    assert exc_info.value.status_code == 409
+    monkeypatch.setattr(sheet_import_service, "sync_from_sheet", full_import)
+
+    await sheet_import_service.sync_shortlist_sheet_incremental(opportunity_id="opp-e")
+
+    assert calls == [{"opportunity_id": "opp-e", "kind": "shortlist", "confirm": True, "force": True}]
+
+
+@pytest.mark.asyncio
+async def test_incremental_shortlist_without_uuids_reimports_the_sheet_in_full(monkeypatch):
+    opportunity = {
+        "_id": "opp-c",
+        "company_sheet": URL,
+        "shortlist_sync": {"source_record_ids": [], "shortlisted_student_ids": []},
+    }
+    sheet = "Full Name\tResume\nAlice\thttp://resume\n"
+    imported = []
+    monkeypatch.setattr(sheet_import_service, "get_database", lambda: FakeDB())
+    monkeypatch.setattr(sheet_import_service, "load_opportunity", lambda db, opportunity_id: _async_value((opportunity, {})))
+    monkeypatch.setattr(sheet_import_service, "fetch_sheet_text", lambda url: _async_value(sheet))
+
+    async def import_rows(**kwargs):
+        imported.append(kwargs)
+        return {"mode": "applied", "counts": {}}
+
+    monkeypatch.setattr(sheet_import_service, "import_shortlist", import_rows)
+
+    result = await sheet_import_service.sync_shortlist_sheet_incremental(opportunity_id="opp-c")
+
+    assert imported == [{"opportunity_id": "opp-c", "raw_text": sheet, "confirm": True}]
+    assert result["source_url"] == URL
 
 
 @pytest.mark.asyncio
 async def test_incremental_shortlist_does_not_advance_on_import_failure(monkeypatch):
     opportunity = {
         "_id": "opp-d",
-        "company_sheet": "https://docs.google.com/spreadsheets/d/abc/edit",
+        "company_sheet": URL,
         "shortlist_sync": {
             "source_record_ids": ["11111111-1111-1111-1111-111111111111"],
             "shortlisted_student_ids": ["student-a"],

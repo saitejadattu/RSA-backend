@@ -6,6 +6,7 @@ from app.db.collections import APPLICATIONS, STATUS_HISTORY
 from app.db.mongodb import get_database
 from app.models.application import final_status_for, interested_for_api, normalize_application_status, status_for_api
 from app.schemas.status_history import ApplicationStatusUpdate
+from app.services.opportunity_counter_service import refresh_opportunity_counts
 from app.utils.mongo import serialize_mongo
 from app.utils.object_id import to_object_id
 
@@ -82,6 +83,7 @@ async def update_application_status(application_id: str, payload: ApplicationSta
         changed_by_role=payload.changed_by_role,
         source=payload.source,
     )
+    await refresh_opportunity_counts(application.get("opportunity_id"))
     updated_application = await db[APPLICATIONS].find_one({"_id": object_id})
     return {"application": serialize_mongo(updated_application), "status_history": history}
 
