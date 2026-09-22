@@ -1,7 +1,26 @@
-from app.db.collections import APPLICATIONS, COMPANIES, HIRING_OPPORTUNITIES
+from fastapi import HTTPException, status
+
+from app.db.collections import APPLICATIONS, COMPANIES, HIRING_OPPORTUNITIES, STUDENTS
 from app.db.mongodb import get_database
 from app.models.application import is_real_application
 from app.utils.mongo import serialize_mongo
+from app.utils.object_id import to_object_id
+
+
+async def load_student(student_id: str) -> dict:
+    """One student by id, as the student-facing services expect them.
+
+    Lets an admin screen build the very payload the student is served, instead
+    of a second rendering of the same data that can drift from it.
+    """
+    try:
+        object_id = to_object_id(student_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid student id")
+    student = await get_database()[STUDENTS].find_one({"_id": object_id})
+    if not student:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Student not found")
+    return student
 
 
 STATUS_LABELS = {

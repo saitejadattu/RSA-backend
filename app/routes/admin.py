@@ -36,7 +36,15 @@ from app.services.admin_dashboard_service import (
     update_student_placement,
 )
 from app.services.admin_issue_service import get_admin_issue, list_admin_issues, update_admin_issue_status
-from app.services.interview_report_service import list_questions, question_bank, set_report_visibility
+from app.services.interview_report_service import (
+    list_questions,
+    list_student_reports,
+    question_bank,
+    set_report_visibility,
+    student_practice_questions,
+)
+from app.services.student_dashboard_service import get_student_dashboard, load_student
+from app.services.student_issue_service import list_student_issues
 from app.services.rsa_usage_service import get_admin_rsa_usage
 from app.services.sheet_import_service import (
     import_master_from_url,
@@ -52,6 +60,7 @@ from app.services.sheet_import_service import (
 )
 from app.jobs.incremental_sync import describe_failure, run_full_sync, run_incremental_sync, run_paste_sync
 from app.utils.dependencies import require_admin_access
+from app.utils.mongo import serialize_mongo
 
 
 router = APIRouter(prefix="/admin", tags=["Admin"], dependencies=[Depends(require_admin_access)])
@@ -84,6 +93,63 @@ async def students(limit: int = Query(default=500, ge=1, le=1000)) -> list[dict]
 async def student_detail(student_id: str) -> dict:
     """Full profile for one student: info, pipeline stats, applications, role mix, reports."""
     return await get_admin_student_detail(student_id)
+
+
+# ---- view as student -------------------------------------------------------
+# The admin student screen renders the student's own dashboard, so support can
+# see exactly what the student sees. These serve the very payloads the
+# /students/me routes serve, for one student, read-only: same services, so the
+# two views cannot drift apart. Nothing here writes, and nothing exposes data
+# the student themselves cannot see.
+
+
+@router.get("/students/{student_id}/view/profile")
+async def student_view_profile(student_id: str) -> dict:
+    """The header fields of the student's own profile.
+
+    Deliberately field-by-field rather than the whole document: that document
+    also holds the password hash and reset flags, which belong to nobody but the
+    student.
+    """
+    student = await load_student(student_id)
+    return serialize_mongo({
+        field: student.get(field)
+        for field in ("_id", "external_user_id", "name", "email", "phone", "stack", "resume_link")
+    })
+
+
+@router.get("/students/{student_id}/view/dashboard")
+async def student_view_dashboard(student_id: str) -> dict:
+    return await get_student_dashboard(await load_student(student_id))
+
+
+@router.get("/students/{student_id}/view/reports")
+async def student_view_reports(student_id: str) -> list[dict]:
+    """Only reports published to the student, exactly as they see them."""
+    student = await load_student(student_id)
+    return await list_student_reports(student["_id"])
+
+
+@router.get("/students/{student_id}/view/issues")
+async def student_view_issues(student_id: str) -> list[dict]:
+    return await list_student_issues(await load_student(student_id))
+
+
+@router.get("/students/{student_id}/view/practice-questions")
+async def student_view_practice_questions(
+    student_id: str,
+    include_scenario: bool = Query(default=False),
+    category: str | None = None,
+    company: str | None = None,
+    difficulty: str | None = None,
+    search: str | None = None,
+    limit: int = Query(default=300, ge=1, le=500),
+) -> dict:
+    await load_student(student_id)
+    return await student_practice_questions(
+        include_scenario=include_scenario, category=category, company=company,
+        difficulty=difficulty, search=search, limit=limit,
+    )
 
 
 @router.get("/issues")
