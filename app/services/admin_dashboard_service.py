@@ -212,8 +212,10 @@ async def get_admin_dashboard() -> dict:
     placed = len(placed_students)
 
     funnel = [
-        {"key": "applied", "label": "Applied", "sub": "all applications", "n": response_count},
-        {"key": "interested", "label": "Interested", "sub": "student opted in", "n": total_applications},
+        # One intake number, the same one every other screen calls Applied:
+        # everyone on a response sheet except those who said they weren't
+        # interested. (The raw sheet-row total is summary.response_count.)
+        {"key": "applied", "label": "Applied", "sub": "student opted in", "n": total_applications},
         {"key": "shortlisted", "label": "Shortlisted", "sub": "company picked them", "n": shortlisted_count},
         {"key": "interviewing", "label": "Interviewing", "sub": "in process now", "n": interviewing_count},
         {"key": "placed", "label": "Selected / joined", "sub": "placed", "n": hired_count},
