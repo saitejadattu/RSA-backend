@@ -20,6 +20,7 @@ from app.db.collections import (
 )
 from app.db.mongodb import get_database
 from app.models.application import normalize_application_status
+from app.services.opportunity_counter_service import counts_by_opportunity
 from app.services.transcript_service import resolve_interview_date
 from app.utils.mongo import serialize_mongo
 from app.utils.object_id import to_object_id
@@ -159,6 +160,13 @@ async def get_admin_dashboard() -> dict:
     status_breakdown, recent_applications, recent_opportunities, repeated_companies = await asyncio.gather(
         status_task, recent_apps_task, recent_opps_task, repeated_task
     )
+
+    # Applied / Shortlisted come from the applications themselves, not from the
+    # counters stored on the opening: those are blank on everything imported
+    # before counters existed, which showed "0" beside a real shortlist.
+    live_counts = await counts_by_opportunity([item["_id"] for item in recent_opportunities])
+    for opportunity in recent_opportunities:
+        opportunity.update(live_counts.get(opportunity["_id"], {}))
 
     # ---- Overview funnel + action center: fire every read concurrently ----
     cutoff = datetime.now(timezone.utc) - timedelta(days=30)

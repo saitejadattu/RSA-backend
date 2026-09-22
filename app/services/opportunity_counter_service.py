@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import Any
 
@@ -27,6 +28,41 @@ SHORTLIST_COUNT_FILTER = {
         {"current_status": {"$exists": False}, "status": "shortlisted"},
     ]
 }
+
+
+async def counts_by_opportunity(opportunity_ids: list[Any]) -> dict[Any, dict[str, int]]:
+    """Applied and shortlisted per opening, counted from the applications.
+
+    The same numbers refresh_opportunity_counts stores, but read live. Screens
+    that list many openings at once use this instead of the stored counters: a
+    counter can be stale (it was blank on openings imported before counters
+    existed, and a master import used to overwrite it), and a dashboard that
+    says 0 next to a shortlist that exists is worse than a slightly slower one.
+    """
+    db = get_database()
+    ids = list(opportunity_ids)
+    if not ids:
+        return {}
+
+    async def grouped(match: dict) -> dict[Any, int]:
+        rows = await db[APPLICATIONS].aggregate([
+            {"$match": match},
+            {"$group": {"_id": "$opportunity_id", "n": {"$sum": 1}}},
+        ]).to_list(length=None)
+        return {row["_id"]: row["n"] for row in rows}
+
+    # Both reuse the filters above, so these can never drift from the stored counts.
+    applied, shortlisted = await asyncio.gather(
+        grouped({"opportunity_id": {"$in": ids}, **APPLICATION_COUNT_FILTER}),
+        grouped({"$and": [{"opportunity_id": {"$in": ids}}, APPLICATION_COUNT_FILTER, SHORTLIST_COUNT_FILTER]}),
+    )
+    return {
+        opportunity_id: {
+            "application_count": applied.get(opportunity_id, 0),
+            "shortlists_count": shortlisted.get(opportunity_id, 0),
+        }
+        for opportunity_id in ids
+    }
 
 
 def _status_value(application: dict[str, Any]) -> str | None:
