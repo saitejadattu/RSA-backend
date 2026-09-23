@@ -330,9 +330,32 @@ async def list_recent_applications(limit: int = 50, status_value: str | None = N
     return serialize_mongo(applications)
 
 
-async def list_admin_students(limit: int = 500) -> list[dict]:
+def student_search_filter(search: str | None) -> dict:
+    """Match a student by any of the three things an admin types: name, email,
+    phone. Escaped, so a search for "a.b" cannot behave as a pattern."""
+    term = (search or "").strip()
+    if not term:
+        return {}
+    pattern = re.escape(term)
+    return {
+        "$or": [
+            {"name": {"$regex": pattern, "$options": "i"}},
+            {"email": {"$regex": pattern, "$options": "i"}},
+            {"phone": {"$regex": pattern}},
+        ]
+    }
+
+
+async def list_admin_students(limit: int = 500, search: str | None = None) -> list[dict]:
+    """Students for the admin list, alphabetically, capped at `limit`.
+
+    The search runs here rather than in the browser: the list is capped, so
+    filtering only what was already sent hides every student past the cap - with
+    882 students and a cap of 500, nobody after "P" could be found at all.
+    """
     db = get_database()
-    students = await db[STUDENTS].find({}).sort("name", 1).limit(limit).to_list(length=limit)
+    query = student_search_filter(search)
+    students = await db[STUDENTS].find(query).sort("name", 1).limit(limit).to_list(length=limit)
     student_ids = [student["_id"] for student in students]
     if not student_ids:
         return []

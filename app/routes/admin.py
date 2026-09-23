@@ -76,8 +76,11 @@ async def rsa_usage() -> dict:
 
 
 @router.get("/students")
-async def students(limit: int = Query(default=500, ge=1, le=1000)) -> list[dict]:
-    return await list_admin_students(limit=limit)
+async def students(
+    limit: int = Query(default=500, ge=1, le=1000),
+    search: str | None = Query(default=None, description="Matches name, email or phone."),
+) -> list[dict]:
+    return await list_admin_students(limit=limit, search=search)
 
 
 @router.get("/students/{student_id}")
