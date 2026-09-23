@@ -98,7 +98,14 @@ async def get_admin_issue(issue_id: str) -> dict:
     })
 
 
-async def update_admin_issue_status(issue_id: str, new_status: str, admin: dict) -> dict:
+async def update_admin_issue_status(
+    issue_id: str, new_status: str, admin: dict, response: str | None = None
+) -> dict:
+    """Move a ticket, recording the admin's reply to the student.
+
+    A ticket cannot be closed without one. The student is told what happened -
+    a ticket that silently flips to CLOSED answers nothing, and they reopen it.
+    """
     db = get_database()
     try:
         object_id = to_object_id(issue_id)
@@ -109,12 +116,30 @@ async def update_admin_issue_status(issue_id: str, new_status: str, admin: dict)
     if not issue:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Issue not found")
 
+    message = (response or "").strip()
+    if new_status == "CLOSED" and not message:
+        # The schema rejects this too; kept here so no other caller can close a
+        # ticket silently.
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Write a response for the student before closing this ticket.",
+        )
+
     now = datetime.now(timezone.utc)
+    author = _admin_audit_identity(admin)
     fields = {
         "status": new_status,
         "updated_at": now,
-        "updated_by": _admin_audit_identity(admin),
+        "updated_by": author,
         "resolved_at": now if new_status == "CLOSED" else None,
     }
-    await db[STUDENT_ISSUES].update_one({"_id": object_id}, {"$set": fields})
+    update: dict = {"$set": fields}
+    if message:
+        reply = {"message": message, "responded_at": now, "responded_by": author}
+        fields["resolution"] = reply
+        # Every reply is kept, so reopening and answering again reads as a thread
+        # rather than overwriting what the student was told last time.
+        update["$push"] = {"resolution_history": reply}
+
+    await db[STUDENT_ISSUES].update_one({"_id": object_id}, update)
     return await get_admin_issue(issue_id)

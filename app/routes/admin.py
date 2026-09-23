@@ -111,7 +111,7 @@ async def update_issue_status(
     payload: StudentIssueStatusUpdate,
     admin: dict = Depends(require_admin_access),
 ) -> dict:
-    return await update_admin_issue_status(issue_id, payload.status, admin)
+    return await update_admin_issue_status(issue_id, payload.status, admin, payload.response)
 
 
 @router.patch("/students/{student_id}/placement")

@@ -10,8 +10,46 @@ def _display_status(value: str | None) -> str:
     return {"OPEN": "IN_PROGRESS", "RESOLVED": "CLOSED"}.get(value, value or "IN_PROGRESS")
 
 
+def _reply_for_student(reply: dict | None) -> dict | None:
+    """One admin reply as the student sees it: the answer and when it came.
+
+    The stored reply also carries the admin's id and email - internal audit
+    data that is no business of the student's.
+    """
+    if not reply or not (reply.get("message") or "").strip():
+        return None
+    return {
+        "message": reply["message"],
+        "responded_at": reply.get("responded_at"),
+        "responded_by": (reply.get("responded_by") or {}).get("name") or "RSA team",
+    }
+
+
+def _updated_by_for_student(issue: dict) -> dict | None:
+    """Who last touched the ticket, as the student may see it.
+
+    Their own reopen keeps its full record; an admin's is reduced to a name,
+    since the stored one carries that admin's id and email.
+    """
+    who = issue.get("updated_by")
+    if not who:
+        return who
+    if issue.get("updated_by_type") == "STUDENT":
+        return who
+    return {"name": who.get("name") or "RSA team"}
+
+
 def _student_issue(issue: dict) -> dict:
-    return {**issue, "status": _display_status(issue.get("status"))}
+    shaped = {**issue, "status": _display_status(issue.get("status"))}
+    # What the admin answered - the reason this ticket was closed.
+    shaped["resolution"] = _reply_for_student(issue.get("resolution"))
+    shaped["replies"] = [
+        reply for reply in (_reply_for_student(item) for item in issue.get("resolution_history") or []) if reply
+    ]
+    shaped.pop("resolution_history", None)
+    if "updated_by" in shaped:
+        shaped["updated_by"] = _updated_by_for_student(issue)
+    return shaped
 
 
 async def create_student_issue(student: dict, payload) -> dict:

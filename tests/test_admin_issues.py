@@ -104,11 +104,14 @@ async def test_admin_issue_status_update_records_audit_and_resolved_at(monkeypat
         str(issue_id),
         "CLOSED",
         {"sub": str(ObjectId()), "name": "Admin One", "email": "admin@example.com"},
+        # Closing now carries the answer the student is shown.
+        response="Your applications are visible again.",
     )
 
     assert result["status"] == "CLOSED"
     assert result["updated_by"]["name"] == "Admin One"
     assert result["updated_by"]["email"] == "admin@example.com"
+    assert result["resolution"]["message"] == "Your applications are visible again."
     assert result["resolved_at"] is not None
     assert result["updated_at"] is not None
 

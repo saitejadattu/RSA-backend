@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class OpportunityDeleteRequest(BaseModel):
@@ -8,7 +8,24 @@ class OpportunityDeleteRequest(BaseModel):
 
 
 class StudentIssueStatusUpdate(BaseModel):
+    """A status change on a student's ticket, with the admin's reply.
+
+    Closing needs a reply: the student raised the ticket because something was
+    wrong for them, and a ticket that just turns CLOSED tells them nothing.
+    """
+
     status: Literal["IN_PROGRESS", "CLOSED"]
+    response: str | None = Field(
+        default=None,
+        max_length=4000,
+        description="The admin's answer, shown to the student. Required when closing.",
+    )
+
+    @model_validator(mode="after")
+    def _closing_requires_an_answer(self) -> "StudentIssueStatusUpdate":
+        if self.status == "CLOSED" and not (self.response or "").strip():
+            raise ValueError("Write a response for the student before closing this ticket.")
+        return self
 
 
 class MasterIncrementalRequest(BaseModel):
